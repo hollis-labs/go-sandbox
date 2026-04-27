@@ -1,0 +1,11 @@
+id: workspace-only
+description: "Read+write the workspace, deny network and ~/.ssh, allow subprocess"
+fs:
+  read:
+    - workspace
+  write:
+    - workspace
+  deny:
+    - ${HOME}/.ssh
+net: false
+subprocess: true
