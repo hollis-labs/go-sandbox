@@ -93,6 +93,32 @@ func TestBwrapArgs_FSWriteAndRead(t *testing.T) {
 	}
 }
 
+// TestExpandPathLinux_TildeExpansion ensures that only a leading "~" or "~/"
+// is treated as the home directory — a tilde mid-path (e.g. "/cache/foo~2")
+// must not be corrupted. Regression test for the strings.ReplaceAll bug.
+func TestExpandPathLinux_TildeExpansion(t *testing.T) {
+	home := "/home/testuser"
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"~", home},
+		{"~/foo", home + "/foo"},
+		{"~/foo/bar", home + "/foo/bar"},
+		{"/cache/foo~2", "/cache/foo~2"},    // mid-path ~ must not expand
+		{"/var/tmp~backup", "/var/tmp~backup"}, // same
+		{"${HOME}/baz", home + "/baz"},
+		{"/explicit/path", "/explicit/path"},
+		{"workspace", "/ws"},
+	}
+	for _, tc := range cases {
+		got := expandPathLinux(tc.raw, "/ws", home)
+		if got != tc.want {
+			t.Errorf("expandPathLinux(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 // TestApply_ReturnsCleanup is a smoke test that Apply returns a non-nil
 // cleanup function on supported platforms (or an error if bwrap is absent).
 func TestApply_ReturnsCleanup(t *testing.T) {

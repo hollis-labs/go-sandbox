@@ -161,6 +161,23 @@ func TestBuildSBPL_DenyPaths(t *testing.T) {
 	}
 }
 
+// TestExpandPath_TildeExpansion ensures that only a leading "~" or "~/"
+// is treated as the home directory — a tilde mid-path (e.g. "/cache/foo~2")
+// must not be corrupted. Regression test for the strings.ReplaceAll bug.
+func TestExpandPath_TildeExpansion(t *testing.T) {
+	// We can't hard-code os.UserHomeDir() in the test, so test with the
+	// SBPL builder: a mid-path tilde must survive into the emitted profile
+	// unchanged (it's a valid filesystem byte, not a POSIX unsafe char).
+	safe := "/tmp/cache~2"
+	sbpl, err := BuildSBPL(Profile{ID: "t", FS: FSSpec{Deny: []string{safe}}}, "/tmp/ws")
+	if err != nil {
+		t.Fatalf("BuildSBPL: %v", err)
+	}
+	if !strings.Contains(sbpl, safe) {
+		t.Errorf("BuildSBPL corrupted mid-path tilde: want %q in output\n%s", safe, sbpl)
+	}
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

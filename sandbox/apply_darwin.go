@@ -153,15 +153,23 @@ func expandAndValidate(field, raw, workspace string) (string, error) {
 	return path, nil
 }
 
-// expandPath resolves the "workspace", "${HOME}", and "~" tokens. Empty
-// paths are returned as-is; the validator catches them downstream.
+// expandPath resolves the "workspace", "${HOME}", and leading "~" tokens.
+// Only a bare "~" or a "~/" prefix is expanded — "~" mid-path (e.g.
+// "/cache/foo~2") is intentionally left untouched to avoid corrupting
+// filenames that happen to contain a tilde. Empty paths are returned
+// as-is; the validator catches them downstream.
 func expandPath(raw, workspace string) string {
 	if raw == "workspace" {
 		return workspace
 	}
 	home, _ := os.UserHomeDir()
 	raw = strings.ReplaceAll(raw, "${HOME}", home)
-	raw = strings.ReplaceAll(raw, "~", home)
+	if raw == "~" {
+		return home
+	}
+	if strings.HasPrefix(raw, "~/") {
+		raw = home + raw[1:]
+	}
 	return raw
 }
 

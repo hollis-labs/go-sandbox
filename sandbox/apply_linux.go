@@ -140,7 +140,12 @@ func expandPathLinux(raw, workspace, home string) string {
 		return workspace
 	}
 	raw = strings.ReplaceAll(raw, "${HOME}", home)
-	raw = strings.ReplaceAll(raw, "~", home)
+	if raw == "~" {
+		return home
+	}
+	if strings.HasPrefix(raw, "~/") {
+		raw = home + raw[1:]
+	}
 	return raw
 }
 
