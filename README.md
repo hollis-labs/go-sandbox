@@ -37,6 +37,7 @@ func main() {
         },
         Net:           false,                       // deny outbound
         AllowLoopback: true,                        // permit loopback while Net=false
+        LoopbackForwardPorts: []int{4317},         // linux: expose host 127.0.0.1:4317 inside the sandbox
         Subprocess: true,                           // allow subprocess (macOS-only enforcement)
     }
 
@@ -63,7 +64,7 @@ Profiles can also be loaded from YAML via `sandbox.LoadProfile` / `sandbox.LoadP
 
 In:
 
-- `Profile` shape (`FS{Read,Write,Deny}` + `Net` + `AllowLoopback` + `Subprocess` + `ID`)
+- `Profile` shape (`FS{Read,Write,Deny}` + `Net` + `AllowLoopback` + `LoopbackForwardPorts` + `Subprocess` + `ID`)
 - `Apply(cmd, profile, workspace) (cleanup, err)` — hardened wrapping of an `*exec.Cmd`
 - macOS SBPL backend with the **non-optional `validateSeatbeltLiteral`** (SBPL profile-string injection is a real CVE shape; the validator runs on every interpolated value before profile emit)
 - Linux bwrap backend with narrowed `--ro-bind` candidate set, per-invocation `--tmpfs /tmp`, namespace unsharing (`--unshare-pid` / `--unshare-ipc` / `--unshare-uts` / `--unshare-cgroup-try` / `--unshare-user-try`), `--die-with-parent`, `--new-session`, conditional `--unshare-net`
@@ -95,6 +96,19 @@ p := sandbox.Profile{
 
 On macOS, the SBPL backend emits explicit localhost `allow` rules before the terminal `(deny network*)`, which covers the tested `127.0.0.1` and `::1` paths under seatbelt's host-filter constraints. On Linux, the bwrap backend still uses `--unshare-net`; a small trampoline path brings `lo` UP inside the unshared namespace and then execs the real target. That enables loopback inside the sandbox namespace itself, but it does not reach a localhost listener in the parent/host namespace.
 
+When a Linux caller needs a host-side localhost service such as a parent-bound MCP server, set `LoopbackForwardPorts` to the explicit TCP ports that should be bridged into the sandbox:
+
+```go
+p := sandbox.Profile{
+    ID:                   "mcp-linux",
+    Net:                  false,
+    LoopbackForwardPorts: []int{4317},
+    Subprocess:           true,
+}
+```
+
+Under the hood, the Linux backend keeps `--unshare-net`, starts a host-side Unix-socket bridge for each forwarded port, and runs a small in-netns supervisor that binds `127.0.0.1:<port>` (and `::1:<port>` when available) inside the sandbox and relays to the host listener. Ports not listed in `LoopbackForwardPorts` remain unreachable.
+
 ## Default-allow rationale
 
 Both backends are default-allow with selective denies, not default-deny.
@@ -110,7 +124,7 @@ The Linux bwrap backend ports rationale comments verbatim from nanite's `os_linu
 - **gap #1** — read-only mounts narrowed from blanket `--ro-bind / /` to a candidate set of `/usr`, `/lib*`, `/bin`, `/sbin`, `/etc/{alternatives,ssl,ca-certificates,resolv.conf,hosts,nsswitch.conf}`. `/home`, `/root`, `/var`, `/srv`, `/opt`, and dotfiles are deliberately not bound — they can contain SSH keys, AWS creds, shell history, and other secrets the agent must not see. See `bwrapRoBindCandidates` in `sandbox/apply_linux.go`.
 - **gap #2** — PID, IPC, UTS, cgroup, user namespaces always unshared so the sandboxed process cannot observe or interfere with host processes. `--unshare-user-try` degrades on hardened distros that disable unprivileged user namespaces; the rest are always available.
 - **gap #3** (partial) — network namespace unshared when `Profile.Net == false`. Full proxy-mediated egress is out of scope for v0; see "Out".
-- **loopback follow-up** — when `Profile.AllowLoopback == true` and `Profile.Net == false`, Linux still unshares the network namespace and raises only the namespace-local `lo` device before execing the target. This keeps non-loopback interfaces out of view while allowing loopback traffic inside the sandbox namespace.
+- **loopback follow-up** — when `Profile.AllowLoopback == true` and `Profile.Net == false`, Linux still unshares the network namespace and raises only the namespace-local `lo` device before execing the target. This keeps non-loopback interfaces out of view while allowing loopback traffic inside the sandbox namespace. If `LoopbackForwardPorts` is set, only those explicit host localhost TCP ports are bridged into the sandbox.
 - **gap #4** — `/tmp` replaced with a per-invocation `--tmpfs` so there is no cross-session leakage through shared `/tmp` files.
 - **gap #5** (partial) — `--die-with-parent` and `--new-session` prevent orphan escape and TTY hijacking.
 
@@ -147,7 +161,7 @@ go-sandbox/
 
 ## Lineage
 
-- **Public API** (`Profile{FS, Net, AllowLoopback, Subprocess, ID}`, `LoadProfile`, `LoadProfiles`) — extracted from `agent-mux/internal/sandbox/profile.go`.
+- **Public API** (`Profile{FS, Net, AllowLoopback, LoopbackForwardPorts, Subprocess, ID}`, `LoadProfile`, `LoadProfiles`) — extracted from `agent-mux/internal/sandbox/profile.go`.
 - **macOS impl + literal validator** — extracted from `nanite/internal/sandbox/os_darwin.go` (`validateSeatbeltLiteral`, seatbelt profile shape).
 - **Linux impl** — extracted from `nanite/internal/sandbox/os_linux.go` (narrowed mounts, namespace unsharing, conditional `--unshare-net`, `--die-with-parent`).
 - **Cleanup pattern** — extracted from nanite's `applyOSSandbox`; the earlier mux Apply leaked the temp profile file, do not regress.
