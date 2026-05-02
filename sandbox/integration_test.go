@@ -207,6 +207,63 @@ func TestAllowLoopback_LoopbackReachable(t *testing.T) {
 	}
 }
 
+func TestLoopbackForward_Linux_HostLoopbackReachable(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only loopback forward test")
+	}
+	requireSandboxTool(t)
+
+	listener := newHTTPListener(t, "tcp4", "127.0.0.1:0")
+	port := listener.Addr().(*net.TCPAddr).Port
+	workspace := t.TempDir()
+
+	p := sandbox.Profile{
+		ID:                   "host-loopback-forward",
+		Net:                  false,
+		LoopbackForwardPorts: []int{port},
+		Subprocess:           true,
+	}
+
+	cmd := helperCommand(t, "http-get", "http://127.0.0.1:"+fmt.Sprint(port))
+	cleanup, err := sandbox.Apply(cmd, p, workspace)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer cleanup()
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("forwarded host loopback GET failed: %v\noutput:\n%s", err, out)
+	}
+}
+
+func TestLoopbackForward_Linux_NonForwardedHostLoopbackBlocked(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only loopback forward test")
+	}
+	requireSandboxTool(t)
+
+	listener := newHTTPListener(t, "tcp4", "127.0.0.1:0")
+	port := listener.Addr().(*net.TCPAddr).Port
+	workspace := t.TempDir()
+
+	p := sandbox.Profile{
+		ID:         "host-loopback-not-forwarded",
+		Net:        false,
+		Subprocess: true,
+	}
+
+	cmd := helperCommand(t, "http-get", "http://127.0.0.1:"+fmt.Sprint(port))
+	cleanup, err := sandbox.Apply(cmd, p, workspace)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer cleanup()
+
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected non-forwarded host loopback GET to fail, but it succeeded\noutput:\n%s", out)
+	}
+}
+
 func TestAllowLoopback_NonLoopbackBlocked(t *testing.T) {
 	requireSandboxTool(t)
 	requireHostCanDial(t, "1.1.1.1:443")
@@ -270,10 +327,11 @@ func TestAllowLoopback_NoOpWhenNetTrue(t *testing.T) {
 
 	workspace := t.TempDir()
 	p := sandbox.Profile{
-		ID:            "allow-loopback-noop",
-		Net:           true,
-		AllowLoopback: true,
-		Subprocess:    true,
+		ID:                   "allow-loopback-noop",
+		Net:                  true,
+		AllowLoopback:        true,
+		LoopbackForwardPorts: []int{4317},
+		Subprocess:           true,
 	}
 
 	cmd := helperCommand(t, "exit-0")

@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -164,7 +165,7 @@ func TestApply_AllowLoopbackResolvesBareCommandName(t *testing.T) {
 
 func TestBwrapArgs_AllowLoopbackHelperBind(t *testing.T) {
 	helperPath := "/tmp/go-sandbox-helper"
-	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir(), helperPath)
+	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir(), helperPath, "")
 	if err != nil {
 		t.Fatalf("buildBwrapArgs: %v", err)
 	}
@@ -177,13 +178,42 @@ func TestBwrapArgs_AllowLoopbackHelperBind(t *testing.T) {
 	}
 }
 
+func TestBwrapArgs_LoopbackForwardDirBind(t *testing.T) {
+	bridgeDir := t.TempDir()
+	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, LoopbackForwardPorts: []int{4317}}, t.TempDir(), "", bridgeDir)
+	if err != nil {
+		t.Fatalf("buildBwrapArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--ro-bind "+bridgeDir+" "+bridgeDir) {
+		t.Fatalf("expected read-only bridge dir bind for loopback forwards\nargs: %s", joined)
+	}
+}
+
 func TestBwrapArgs_AllowLoopbackNoOpWhenNetTrue(t *testing.T) {
-	args, err := BuildBwrapArgs(Profile{ID: "t", Net: true, AllowLoopback: true}, t.TempDir())
+	args, err := BuildBwrapArgs(Profile{ID: "t", Net: true, AllowLoopback: true, LoopbackForwardPorts: []int{4317}}, t.TempDir())
 	if err != nil {
 		t.Fatalf("BuildBwrapArgs: %v", err)
 	}
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "--unshare-net") {
 		t.Fatalf("net=true should remain host-net even when AllowLoopback is set\nargs: %s", joined)
+	}
+}
+
+func TestValidateLoopbackPorts(t *testing.T) {
+	got, err := validateLoopbackPorts([]int{8123, 4317})
+	if err != nil {
+		t.Fatalf("validateLoopbackPorts: %v", err)
+	}
+	if !slices.Equal(got, []int{4317, 8123}) {
+		t.Fatalf("validateLoopbackPorts sorted = %v, want [4317 8123]", got)
+	}
+
+	if _, err := validateLoopbackPorts([]int{0}); err == nil {
+		t.Fatal("expected invalid port error")
+	}
+	if _, err := validateLoopbackPorts([]int{4317, 4317}); err == nil {
+		t.Fatal("expected duplicate port error")
 	}
 }

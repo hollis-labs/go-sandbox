@@ -21,6 +21,7 @@ func main() {
 	workspace := flag.String("workspace", "", "absolute path to the task workspace")
 	allowNet := flag.Bool("net", false, "allow outbound network")
 	allowLoopback := flag.Bool("allow-loopback", false, "allow 127.0.0.0/8 and ::1 while --net=false")
+	loopbackForwardPort := flag.Int("loopback-forward-port", 0, "linux: bridge host 127.0.0.1:<port> into the sandbox")
 	flag.Parse()
 
 	if *workspace == "" {
@@ -40,6 +41,9 @@ func main() {
 		AllowLoopback: *allowLoopback,
 		Subprocess:    true,
 	}
+	if *loopbackForwardPort > 0 {
+		p.LoopbackForwardPorts = []int{*loopbackForwardPort}
+	}
 
 	cmd := exec.Command("/bin/sh", "-c", "echo running in sandbox; ls -la "+*workspace)
 	cmd.Stdout = os.Stdout
@@ -51,7 +55,8 @@ func main() {
 	}
 	defer cleanup()
 
-	fmt.Printf("running task under profile %q (net=%v allow_loopback=%v)\n", p.ID, p.Net, p.AllowLoopback)
+	fmt.Printf("running task under profile %q (net=%v allow_loopback=%v loopback_forward_ports=%v)\n",
+		p.ID, p.Net, p.AllowLoopback, p.LoopbackForwardPorts)
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("task failed: %v", err)
 	}

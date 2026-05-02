@@ -34,6 +34,10 @@ type Profile struct {
 	// AllowLoopback permits loopback traffic to 127.0.0.0/8 and ::1 even
 	// when Net is false. It is a no-op when Net is true.
 	AllowLoopback bool `yaml:"allow_loopback"`
+	// LoopbackForwardPorts exposes selected host 127.0.0.1 TCP ports inside
+	// the Linux sandbox namespace while Net is false. It is currently a
+	// Linux-only bridge mechanism and a no-op on other platforms.
+	LoopbackForwardPorts []int `yaml:"loopback_forward_ports"`
 	// Subprocess controls whether the session may spawn child processes
 	// beyond the agent binary itself. macOS enforces this via SBPL
 	// process-fork / process-exec* denies; Linux bwrap does not directly

@@ -24,6 +24,9 @@ fs:
     - ${HOME}/.ssh
 net: false
 allow_loopback: true
+loopback_forward_ports:
+  - 4317
+  - 8123
 subprocess: true
 `
 	path := filepath.Join(dir, "workspace-only.yaml")
@@ -53,6 +56,9 @@ subprocess: true
 	if !p.AllowLoopback {
 		t.Error("AllowLoopback = false, want true")
 	}
+	if !slices.Equal(p.LoopbackForwardPorts, []int{4317, 8123}) {
+		t.Errorf("LoopbackForwardPorts = %v, want [4317 8123]", p.LoopbackForwardPorts)
+	}
 	if !p.Subprocess {
 		t.Error("Subprocess = false, want true")
 	}
@@ -69,6 +75,8 @@ fs:
     - workspace
 net: false
 allow_loopback: true
+loopback_forward_ports:
+  - 4317
 subprocess: true
 `
 	path := filepath.Join(dir, "loopback.yaml")
@@ -98,6 +106,7 @@ subprocess: true
 		loaded.Description != roundTrip.Description ||
 		loaded.Net != roundTrip.Net ||
 		loaded.AllowLoopback != roundTrip.AllowLoopback ||
+		!slices.Equal(loaded.LoopbackForwardPorts, roundTrip.LoopbackForwardPorts) ||
 		loaded.Subprocess != roundTrip.Subprocess {
 		t.Fatalf("round-trip mismatch:\nloaded=%#v\nroundTrip=%#v", loaded, roundTrip)
 	}

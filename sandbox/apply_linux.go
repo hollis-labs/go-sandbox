@@ -3,11 +3,18 @@
 package sandbox
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // bwrapRoBindCandidates is the narrowed set of host paths the sandboxed
@@ -67,10 +74,10 @@ var bwrapRoBindCandidates = []string{
 // p.Net == true keeps the sandbox in the host netns. See README "Out of
 // scope: network proxy subsystem".
 func BuildBwrapArgs(p Profile, workspace string) ([]string, error) {
-	return buildBwrapArgs(p, workspace, "")
+	return buildBwrapArgs(p, workspace, "", "")
 }
 
-func buildBwrapArgs(p Profile, workspace, helperPath string) ([]string, error) {
+func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]string, error) {
 	absWS, err := filepath.Abs(workspace)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace dir: %w", err)
@@ -88,6 +95,9 @@ func buildBwrapArgs(p Profile, workspace, helperPath string) ([]string, error) {
 
 	if helperPath != "" && !pathVisibleInSandbox(helperPath, absWS, p) {
 		args = append(args, "--ro-bind", helperPath, helperPath)
+	}
+	if bridgeDir != "" && !pathVisibleInSandbox(bridgeDir, absWS, p) {
+		args = append(args, "--ro-bind", bridgeDir, bridgeDir)
 	}
 
 	// Workspace is the writable root; per-invocation /tmp avoids host leakage.
@@ -214,9 +224,11 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 	origArgs := cmd.Args[1:]
 	payloadPath := origPath
 	payloadArgs := origArgs
+	useLoopbackHelper := !p.Net && (p.AllowLoopback || len(p.LoopbackForwardPorts) > 0)
+	var bridge *loopbackForwarders
 
 	helperPath := ""
-	if p.AllowLoopback && !p.Net {
+	if useLoopbackHelper {
 		resolvedOrigPath := origPath
 		if !filepath.IsAbs(resolvedOrigPath) {
 			resolvedOrigPath, err = exec.LookPath(origPath)
@@ -224,8 +236,17 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 				return nil, fmt.Errorf("resolve sandbox target %q: %w", origPath, err)
 			}
 		}
+		if len(p.LoopbackForwardPorts) > 0 {
+			bridge, err = startLoopbackForwarders(p.LoopbackForwardPorts)
+			if err != nil {
+				return nil, err
+			}
+		}
 		helperPath, err = os.Executable()
 		if err != nil {
+			if bridge != nil {
+				bridge.Close()
+			}
 			return nil, fmt.Errorf("resolve loopback helper executable: %w", err)
 		}
 		if resolved, resolveErr := filepath.EvalSymlinks(helperPath); resolveErr == nil {
@@ -234,10 +255,23 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 		payloadPath = helperPath
 		payloadArgs = append([]string{loopbackHelperArg, resolvedOrigPath}, origArgs...)
 		cmd.Env = append(inheritedEnv(cmd.Env), loopbackHelperEnv+"=1")
+		if bridge != nil {
+			cmd.Env = append(cmd.Env,
+				loopbackHelperForwardDirEnv+"="+bridge.dir,
+				loopbackHelperForwardPortsEnv+"="+encodeLoopbackPorts(bridge.ports),
+			)
+		}
 	}
 
-	bwrapArgs, err := buildBwrapArgs(p, workspace, helperPath)
+	bridgeDir := ""
+	if bridge != nil {
+		bridgeDir = bridge.dir
+	}
+	bwrapArgs, err := buildBwrapArgs(p, workspace, helperPath, bridgeDir)
 	if err != nil {
+		if bridge != nil {
+			bridge.Close()
+		}
 		return nil, err
 	}
 
@@ -250,7 +284,11 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 	cmd.Path = bwrapBin
 	cmd.Args = full
 
-	return func() {}, nil
+	return func() {
+		if bridge != nil {
+			bridge.Close()
+		}
+	}, nil
 }
 
 func inheritedEnv(env []string) []string {
@@ -258,4 +296,139 @@ func inheritedEnv(env []string) []string {
 		return append([]string(nil), os.Environ()...)
 	}
 	return append([]string(nil), env...)
+}
+
+type loopbackForwarders struct {
+	dir       string
+	ports     []int
+	listeners []net.Listener
+	once      sync.Once
+}
+
+func startLoopbackForwarders(ports []int) (*loopbackForwarders, error) {
+	validated, err := validateLoopbackPorts(ports)
+	if err != nil {
+		return nil, err
+	}
+
+	dir, err := os.MkdirTemp("", "go-sandbox-loopback-*")
+	if err != nil {
+		return nil, fmt.Errorf("create loopback forwarder dir: %w", err)
+	}
+
+	bridge := &loopbackForwarders{
+		dir:   dir,
+		ports: validated,
+	}
+
+	for _, port := range validated {
+		socketPath := filepath.Join(dir, loopbackSocketName(port))
+		listener, err := net.Listen("unix", socketPath)
+		if err != nil {
+			bridge.Close()
+			return nil, fmt.Errorf("listen on loopback bridge socket for port %d: %w", port, err)
+		}
+		bridge.listeners = append(bridge.listeners, listener)
+		go bridge.serve(listener, port)
+	}
+
+	return bridge, nil
+}
+
+func (f *loopbackForwarders) Close() {
+	f.once.Do(func() {
+		for _, listener := range f.listeners {
+			_ = listener.Close()
+		}
+		_ = os.RemoveAll(f.dir)
+	})
+}
+
+func (f *loopbackForwarders) serve(listener net.Listener, port int) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if isClosedNetworkError(err) {
+				return
+			}
+			continue
+		}
+		go handleLoopbackForwardConn(conn, port)
+	}
+}
+
+func handleLoopbackForwardConn(conn net.Conn, port int) {
+	defer conn.Close()
+
+	target, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return
+	}
+	defer target.Close()
+
+	proxyConns(conn, target)
+}
+
+func proxyConns(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(a, b)
+		if tcp, ok := a.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		} else {
+			_ = a.Close()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(b, a)
+		if tcp, ok := b.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		} else {
+			_ = b.Close()
+		}
+	}()
+
+	wg.Wait()
+}
+
+func validateLoopbackPorts(ports []int) ([]int, error) {
+	if len(ports) == 0 {
+		return nil, nil
+	}
+
+	validated := slices.Clone(ports)
+	slices.Sort(validated)
+	for i, port := range validated {
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid loopback forward port %d", port)
+		}
+		if i > 0 && validated[i-1] == port {
+			return nil, fmt.Errorf("duplicate loopback forward port %d", port)
+		}
+	}
+	return validated, nil
+}
+
+func encodeLoopbackPorts(ports []int) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		parts = append(parts, strconv.Itoa(port))
+	}
+	return strings.Join(parts, ",")
+}
+
+func loopbackSocketName(port int) string {
+	return fmt.Sprintf("%d.sock", port)
+}
+
+func isClosedNetworkError(err error) bool {
+	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
 }
