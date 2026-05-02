@@ -178,7 +178,6 @@ func TestSandbox_NetworkAllowedWhenNetTrue(t *testing.T) {
 func TestAllowLoopback_LoopbackReachable(t *testing.T) {
 	requireSandboxTool(t)
 
-	listener := newHTTPListener(t, "tcp4", "127.0.0.1:0")
 	workspace := t.TempDir()
 
 	p := sandbox.Profile{
@@ -188,7 +187,15 @@ func TestAllowLoopback_LoopbackReachable(t *testing.T) {
 		Subprocess:    true,
 	}
 
-	cmd := helperCommand(t, "http-get", "http://"+listener.Addr().String())
+	cmdArgs := []string{"http-get", "http://127.0.0.1:0"}
+	if runtime.GOOS == "linux" {
+		cmdArgs = []string{"self-http-roundtrip", "tcp4", "127.0.0.1:0"}
+	} else {
+		listener := newHTTPListener(t, "tcp4", "127.0.0.1:0")
+		cmdArgs = []string{"http-get", "http://" + listener.Addr().String()}
+	}
+
+	cmd := helperCommand(t, cmdArgs...)
 	cleanup, err := sandbox.Apply(cmd, p, workspace)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -230,7 +237,6 @@ func TestAllowLoopback_IPv6LoopbackReachable(t *testing.T) {
 		t.Skip("::1 loopback is not available on this host")
 	}
 
-	listener := newHTTPListener(t, "tcp6", "[::1]:0")
 	workspace := t.TempDir()
 	p := sandbox.Profile{
 		ID:            "allow-loopback-v6",
@@ -239,7 +245,15 @@ func TestAllowLoopback_IPv6LoopbackReachable(t *testing.T) {
 		Subprocess:    true,
 	}
 
-	cmd := helperCommand(t, "http-get", "http://"+listener.Addr().String())
+	cmdArgs := []string{"http-get", "http://[::1]:0"}
+	if runtime.GOOS == "linux" {
+		cmdArgs = []string{"self-http-roundtrip", "tcp6", "[::1]:0"}
+	} else {
+		listener := newHTTPListener(t, "tcp6", "[::1]:0")
+		cmdArgs = []string{"http-get", "http://" + listener.Addr().String()}
+	}
+
+	cmd := helperCommand(t, cmdArgs...)
 	cleanup, err := sandbox.Apply(cmd, p, workspace)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -345,6 +359,12 @@ func TestSandboxHelperProcess(t *testing.T) {
 			fmt.Println(iface.Name)
 		}
 		os.Exit(0)
+	case "self-http-roundtrip":
+		if sep+3 >= len(os.Args) {
+			fmt.Fprintln(os.Stderr, "missing network/address")
+			os.Exit(2)
+		}
+		doSelfHTTPRoundTrip(os.Args[sep+2], os.Args[sep+3])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper command %q\n", os.Args[sep+1])
 		os.Exit(2)
@@ -439,4 +459,27 @@ func doTCPDial(addr string) {
 	}
 	_ = conn.Close()
 	os.Exit(0)
+}
+
+func doSelfHTTPRoundTrip(network, addr string) {
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer ln.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		}),
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	doHTTPGet("http://" + ln.Addr().String())
 }

@@ -82,7 +82,7 @@ Out (intentionally):
 
 ## AllowLoopback
 
-`Profile.AllowLoopback` is an additive escape hatch for the MCP-on-loopback case: when `Net == false`, it still permits loopback traffic so the sandboxed child can talk to a parent-bound localhost server. When `Net == true`, the field is a no-op because the sandbox already has full network access.
+`Profile.AllowLoopback` is an additive escape hatch for loopback traffic when `Net == false`. When `Net == true`, the field is a no-op because the sandbox already has full network access.
 
 ```go
 p := sandbox.Profile{
@@ -93,7 +93,7 @@ p := sandbox.Profile{
 }
 ```
 
-On macOS, the SBPL backend emits explicit localhost `allow` rules before the terminal `(deny network*)`, which covers the tested `127.0.0.1` and `::1` paths under seatbelt's host-filter constraints. On Linux, the bwrap backend still uses `--unshare-net`; a small trampoline path brings `lo` UP inside the unshared namespace and then execs the real target, which preserves the existing non-loopback isolation story.
+On macOS, the SBPL backend emits explicit localhost `allow` rules before the terminal `(deny network*)`, which covers the tested `127.0.0.1` and `::1` paths under seatbelt's host-filter constraints. On Linux, the bwrap backend still uses `--unshare-net`; a small trampoline path brings `lo` UP inside the unshared namespace and then execs the real target. That enables loopback inside the sandbox namespace itself, but it does not reach a localhost listener in the parent/host namespace.
 
 ## Default-allow rationale
 
@@ -110,7 +110,7 @@ The Linux bwrap backend ports rationale comments verbatim from nanite's `os_linu
 - **gap #1** — read-only mounts narrowed from blanket `--ro-bind / /` to a candidate set of `/usr`, `/lib*`, `/bin`, `/sbin`, `/etc/{alternatives,ssl,ca-certificates,resolv.conf,hosts,nsswitch.conf}`. `/home`, `/root`, `/var`, `/srv`, `/opt`, and dotfiles are deliberately not bound — they can contain SSH keys, AWS creds, shell history, and other secrets the agent must not see. See `bwrapRoBindCandidates` in `sandbox/apply_linux.go`.
 - **gap #2** — PID, IPC, UTS, cgroup, user namespaces always unshared so the sandboxed process cannot observe or interfere with host processes. `--unshare-user-try` degrades on hardened distros that disable unprivileged user namespaces; the rest are always available.
 - **gap #3** (partial) — network namespace unshared when `Profile.Net == false`. Full proxy-mediated egress is out of scope for v0; see "Out".
-- **loopback follow-up** — when `Profile.AllowLoopback == true` and `Profile.Net == false`, Linux still unshares the network namespace and raises only the namespace-local `lo` device before execing the target. This keeps non-loopback interfaces out of view while allowing parent-bound localhost services such as MCP bridges.
+- **loopback follow-up** — when `Profile.AllowLoopback == true` and `Profile.Net == false`, Linux still unshares the network namespace and raises only the namespace-local `lo` device before execing the target. This keeps non-loopback interfaces out of view while allowing loopback traffic inside the sandbox namespace.
 - **gap #4** — `/tmp` replaced with a per-invocation `--tmpfs` so there is no cross-session leakage through shared `/tmp` files.
 - **gap #5** (partial) — `--die-with-parent` and `--new-session` prevent orphan escape and TTY hijacking.
 

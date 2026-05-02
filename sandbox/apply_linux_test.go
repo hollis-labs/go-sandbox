@@ -136,6 +136,32 @@ func TestApply_ReturnsCleanup(t *testing.T) {
 	cleanup()
 }
 
+func TestApply_AllowLoopbackResolvesBareCommandName(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not installed")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not installed")
+	}
+
+	cmd := exec.Command("sh", "-c", "exit 0")
+	_, err := Apply(cmd, Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir())
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	found := false
+	for _, arg := range cmd.Args {
+		if strings.HasSuffix(arg, "/sh") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected trampoline payload to contain resolved target path, got args: %v", cmd.Args)
+	}
+}
+
 func TestBwrapArgs_AllowLoopbackHelperBind(t *testing.T) {
 	helperPath := "/tmp/go-sandbox-helper"
 	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir(), helperPath)

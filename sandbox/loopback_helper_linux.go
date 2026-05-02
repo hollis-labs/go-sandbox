@@ -38,9 +38,9 @@ func init() {
 	}
 }
 
-type iflags struct {
-	name  [syscall.IFNAMSIZ]byte
-	flags uint16
+type ifreq struct {
+	name [syscall.IFNAMSIZ]byte
+	data [24]byte
 }
 
 func bringInterfaceUp(name string) error {
@@ -50,16 +50,19 @@ func bringInterfaceUp(name string) error {
 	}
 	defer syscall.Close(sock)
 
-	var ifl iflags
-	copy(ifl.name[:], name)
+	var ifr ifreq
+	copy(ifr.name[:], name)
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(sock), uintptr(syscall.SIOCGIFFLAGS), uintptr(unsafe.Pointer(&ifl)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(sock), uintptr(syscall.SIOCGIFFLAGS), uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
 		return errno
 	}
 
-	ifl.flags |= uint16(syscall.IFF_UP)
-	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(sock), uintptr(syscall.SIOCSIFFLAGS), uintptr(unsafe.Pointer(&ifl)))
+	flags := *(*uint16)(unsafe.Pointer(&ifr.data[0]))
+	flags |= uint16(syscall.IFF_UP)
+	*(*uint16)(unsafe.Pointer(&ifr.data[0])) = flags
+
+	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(sock), uintptr(syscall.SIOCSIFFLAGS), uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
 		return errno
 	}

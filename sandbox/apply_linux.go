@@ -217,6 +217,13 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 
 	helperPath := ""
 	if p.AllowLoopback && !p.Net {
+		resolvedOrigPath := origPath
+		if !filepath.IsAbs(resolvedOrigPath) {
+			resolvedOrigPath, err = exec.LookPath(origPath)
+			if err != nil {
+				return nil, fmt.Errorf("resolve sandbox target %q: %w", origPath, err)
+			}
+		}
 		helperPath, err = os.Executable()
 		if err != nil {
 			return nil, fmt.Errorf("resolve loopback helper executable: %w", err)
@@ -225,7 +232,7 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 			helperPath = resolved
 		}
 		payloadPath = helperPath
-		payloadArgs = append([]string{loopbackHelperArg, origPath}, origArgs...)
+		payloadArgs = append([]string{loopbackHelperArg, resolvedOrigPath}, origArgs...)
 		cmd.Env = append(inheritedEnv(cmd.Env), loopbackHelperEnv+"=1")
 	}
 
