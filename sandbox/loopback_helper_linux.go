@@ -3,12 +3,10 @@
 package sandbox
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +18,7 @@ import (
 const (
 	loopbackHelperEnv             = "__GO_SANDBOX_LOOPBACK_HELPER"
 	loopbackHelperArg             = "__go_sandbox_loopback_helper__"
+	loopbackSupervisorArg         = "__go_sandbox_loopback_supervisor__"
 	loopbackHelperForwardDirEnv   = "__GO_SANDBOX_LOOPBACK_FORWARD_DIR"
 	loopbackHelperForwardPortsEnv = "__GO_SANDBOX_LOOPBACK_FORWARD_PORTS"
 )
@@ -33,7 +32,12 @@ func init() {
 	if os.Getenv(loopbackHelperEnv) != "1" {
 		return
 	}
-	os.Exit(runLoopbackHelper())
+	switch {
+	case len(os.Args) >= 2 && os.Args[1] == loopbackHelperArg:
+		os.Exit(runLoopbackHelper())
+	case len(os.Args) >= 2 && os.Args[1] == loopbackSupervisorArg:
+		os.Exit(runLoopbackSupervisor())
+	}
 }
 
 type ifreq struct {
@@ -123,31 +127,33 @@ func runLoopbackHelper() int {
 		fatalLoopbackHelper("missing loopback forward dir")
 	}
 
+	if err := startLoopbackSupervisorProcess(forwardDir, ports); err != nil {
+		fatalLoopbackHelper(fmt.Sprintf("start loopback supervisor: %v", err))
+	}
+
+	if err := syscall.Exec(targetPath, targetArgs, filteredHelperEnv()); err != nil {
+		fatalLoopbackHelper(fmt.Sprintf("exec target %q: %v", targetPath, err))
+	}
+	return 0
+}
+
+func runLoopbackSupervisor() int {
+	ports, err := parseLoopbackPorts(os.Getenv(loopbackHelperForwardPortsEnv))
+	if err != nil {
+		fatalLoopbackHelper(fmt.Sprintf("parse loopback forward ports: %v", err))
+	}
+	forwardDir := os.Getenv(loopbackHelperForwardDirEnv)
+	if len(ports) == 0 || forwardDir == "" {
+		fatalLoopbackHelper("missing loopback supervisor configuration")
+	}
+
 	listeners, err := startSandboxLoopbackBridges(forwardDir, ports)
 	if err != nil {
 		fatalLoopbackHelper(fmt.Sprintf("start loopback bridges: %v", err))
 	}
 	defer closeListeners(listeners)
 
-	child := exec.Command(targetPath, os.Args[3:]...)
-	child.Stdin = os.Stdin
-	child.Stdout = os.Stdout
-	child.Stderr = os.Stderr
-	child.Env = filteredHelperEnv()
-
-	if err := child.Start(); err != nil {
-		fatalLoopbackHelper(fmt.Sprintf("start target %q: %v", targetPath, err))
-	}
-	forwardSignals(child.Process)
-
-	if err := child.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode()
-		}
-		fatalLoopbackHelper(fmt.Sprintf("wait for target %q: %v", targetPath, err))
-	}
-	return 0
+	select {}
 }
 
 func parseLoopbackPorts(raw string) ([]int, error) {
@@ -187,6 +193,29 @@ func startSandboxLoopbackBridges(forwardDir string, ports []int) ([]net.Listener
 	return listeners, nil
 }
 
+func startLoopbackSupervisorProcess(forwardDir string, ports []int) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(exe); resolveErr == nil {
+		exe = resolved
+	}
+
+	cmd := exec.Command(exe, loopbackSupervisorArg)
+	cmd.Env = append(filteredHelperEnv(),
+		loopbackHelperEnv+"=1",
+		loopbackHelperForwardDirEnv+"="+forwardDir,
+		loopbackHelperForwardPortsEnv+"="+encodeLoopbackPorts(ports),
+	)
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: syscall.SIGTERM,
+		Setpgid:   true,
+	}
+	return cmd.Start()
+}
+
 func serveSandboxLoopbackBridge(listener net.Listener, socketPath string) {
 	for {
 		conn, err := listener.Accept()
@@ -214,16 +243,4 @@ func closeListeners(listeners []net.Listener) {
 	for _, listener := range listeners {
 		_ = listener.Close()
 	}
-}
-
-func forwardSignals(process *os.Process) {
-	signals := make(chan os.Signal, 4)
-	signal.Notify(signals, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	go func() {
-		for sig := range signals {
-			if process != nil {
-				_ = process.Signal(sig)
-			}
-		}
-	}()
 }

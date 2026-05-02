@@ -185,8 +185,8 @@ func TestBwrapArgs_LoopbackForwardDirBind(t *testing.T) {
 		t.Fatalf("buildBwrapArgs: %v", err)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--bind "+bridgeDir+" "+bridgeDir) {
-		t.Fatalf("expected bridge dir bind for loopback forwards\nargs: %s", joined)
+	if !strings.Contains(joined, "--ro-bind "+bridgeDir+" "+bridgeDir) {
+		t.Fatalf("expected read-only bridge dir bind for loopback forwards\nargs: %s", joined)
 	}
 }
 

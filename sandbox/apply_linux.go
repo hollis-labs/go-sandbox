@@ -97,7 +97,7 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 		args = append(args, "--ro-bind", helperPath, helperPath)
 	}
 	if bridgeDir != "" && !pathVisibleInSandbox(bridgeDir, absWS, p) {
-		args = append(args, "--bind", bridgeDir, bridgeDir)
+		args = append(args, "--ro-bind", bridgeDir, bridgeDir)
 	}
 
 	// Workspace is the writable root; per-invocation /tmp avoids host leakage.
