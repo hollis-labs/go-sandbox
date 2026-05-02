@@ -3,9 +3,11 @@ package sandbox_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/hollis-labs/go-sandbox/sandbox"
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadProfile_RoundTrip(t *testing.T) {
@@ -21,6 +23,7 @@ fs:
   deny:
     - ${HOME}/.ssh
 net: false
+allow_loopback: true
 subprocess: true
 `
 	path := filepath.Join(dir, "workspace-only.yaml")
@@ -47,8 +50,56 @@ subprocess: true
 	if p.Net {
 		t.Error("Net = true, want false")
 	}
+	if !p.AllowLoopback {
+		t.Error("AllowLoopback = false, want true")
+	}
 	if !p.Subprocess {
 		t.Error("Subprocess = false, want true")
+	}
+}
+
+func TestLoadProfile_YAMLRoundTripAllowLoopback(t *testing.T) {
+	dir := t.TempDir()
+	input := `id: loopback
+description: "Loopback-only network access"
+fs:
+  read:
+    - workspace
+  write:
+    - workspace
+net: false
+allow_loopback: true
+subprocess: true
+`
+	path := filepath.Join(dir, "loopback.yaml")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	loaded, err := sandbox.LoadProfile(path)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+
+	marshaled, err := yaml.Marshal(loaded)
+	if err != nil {
+		t.Fatalf("yaml.Marshal: %v", err)
+	}
+
+	var roundTrip sandbox.Profile
+	if err := yaml.Unmarshal(marshaled, &roundTrip); err != nil {
+		t.Fatalf("yaml.Unmarshal round-trip: %v", err)
+	}
+
+	if !slices.Equal(loaded.FS.Read, roundTrip.FS.Read) ||
+		!slices.Equal(loaded.FS.Write, roundTrip.FS.Write) ||
+		!slices.Equal(loaded.FS.Deny, roundTrip.FS.Deny) ||
+		loaded.ID != roundTrip.ID ||
+		loaded.Description != roundTrip.Description ||
+		loaded.Net != roundTrip.Net ||
+		loaded.AllowLoopback != roundTrip.AllowLoopback ||
+		loaded.Subprocess != roundTrip.Subprocess {
+		t.Fatalf("round-trip mismatch:\nloaded=%#v\nroundTrip=%#v", loaded, roundTrip)
 	}
 }
 

@@ -105,7 +105,7 @@ func TestExpandPathLinux_TildeExpansion(t *testing.T) {
 		{"~", home},
 		{"~/foo", home + "/foo"},
 		{"~/foo/bar", home + "/foo/bar"},
-		{"/cache/foo~2", "/cache/foo~2"},    // mid-path ~ must not expand
+		{"/cache/foo~2", "/cache/foo~2"},       // mid-path ~ must not expand
 		{"/var/tmp~backup", "/var/tmp~backup"}, // same
 		{"${HOME}/baz", home + "/baz"},
 		{"/explicit/path", "/explicit/path"},
@@ -134,4 +134,30 @@ func TestApply_ReturnsCleanup(t *testing.T) {
 		t.Fatal("Apply returned nil cleanup")
 	}
 	cleanup()
+}
+
+func TestBwrapArgs_AllowLoopbackHelperBind(t *testing.T) {
+	helperPath := "/tmp/go-sandbox-helper"
+	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir(), helperPath)
+	if err != nil {
+		t.Fatalf("buildBwrapArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--ro-bind "+helperPath+" "+helperPath) {
+		t.Fatalf("expected helper bind for loopback trampoline\nargs: %s", joined)
+	}
+	if !strings.Contains(joined, "--unshare-net") {
+		t.Fatalf("expected loopback-only mode to keep --unshare-net\nargs: %s", joined)
+	}
+}
+
+func TestBwrapArgs_AllowLoopbackNoOpWhenNetTrue(t *testing.T) {
+	args, err := BuildBwrapArgs(Profile{ID: "t", Net: true, AllowLoopback: true}, t.TempDir())
+	if err != nil {
+		t.Fatalf("BuildBwrapArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--unshare-net") {
+		t.Fatalf("net=true should remain host-net even when AllowLoopback is set\nargs: %s", joined)
+	}
 }

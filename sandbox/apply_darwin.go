@@ -130,7 +130,12 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 	}
 
 	if !p.Net {
-		b.WriteString("; Block all outbound network.\n")
+		if p.AllowLoopback {
+			if err := writeLoopbackAllows(&b); err != nil {
+				return "", err
+			}
+		}
+		b.WriteString("; Block all network traffic beyond the loopback allowlist above.\n")
 		b.WriteString("(deny network*)\n\n")
 	}
 
@@ -141,6 +146,29 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+func writeLoopbackAllows(b *strings.Builder) error {
+	for _, literal := range []struct {
+		field string
+		value string
+	}{
+		{field: "network localhost local", value: "localhost:*"},
+		{field: "network localhost remote", value: "localhost:*"},
+	} {
+		if err := validateSeatbeltLiteral(literal.field, literal.value); err != nil {
+			return err
+		}
+	}
+
+	// Seatbelt's host-filter grammar only accepts "localhost" or "*" here,
+	// so localhost is the narrowest allowlist form that preserves tested
+	// 127.0.0.1 and ::1 reachability without broadening non-loopback egress.
+	b.WriteString("; Preserve localhost traffic while keeping non-loopback network denied.\n")
+	b.WriteString("(allow network-bind (local ip \"localhost:*\"))\n")
+	b.WriteString("(allow network-inbound (local ip \"localhost:*\"))\n")
+	b.WriteString("(allow network-outbound (remote ip \"localhost:*\"))\n\n")
+	return nil
 }
 
 // expandAndValidate resolves the "workspace", "${HOME}", and "~" tokens in

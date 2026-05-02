@@ -35,7 +35,8 @@ func main() {
             Read:  []string{"workspace"},
             Deny:  []string{"${HOME}/.ssh"},       // takes precedence over Read
         },
-        Net:        false,                          // deny outbound
+        Net:           false,                       // deny outbound
+        AllowLoopback: true,                        // permit loopback while Net=false
         Subprocess: true,                           // allow subprocess (macOS-only enforcement)
     }
 
@@ -62,7 +63,7 @@ Profiles can also be loaded from YAML via `sandbox.LoadProfile` / `sandbox.LoadP
 
 In:
 
-- `Profile` shape (`FS{Read,Write,Deny}` + `Net` + `Subprocess` + `ID`)
+- `Profile` shape (`FS{Read,Write,Deny}` + `Net` + `AllowLoopback` + `Subprocess` + `ID`)
 - `Apply(cmd, profile, workspace) (cleanup, err)` — hardened wrapping of an `*exec.Cmd`
 - macOS SBPL backend with the **non-optional `validateSeatbeltLiteral`** (SBPL profile-string injection is a real CVE shape; the validator runs on every interpolated value before profile emit)
 - Linux bwrap backend with narrowed `--ro-bind` candidate set, per-invocation `--tmpfs /tmp`, namespace unsharing (`--unshare-pid` / `--unshare-ipc` / `--unshare-uts` / `--unshare-cgroup-try` / `--unshare-user-try`), `--die-with-parent`, `--new-session`, conditional `--unshare-net`
@@ -79,6 +80,21 @@ Out (intentionally):
 - **App vocabulary.** No FSM transitions, no executor tickets, no broker events, no plugin lifecycle. Apps translate raw `*exec.Cmd` invocations + this lib's `Apply` into their own primitives.
 - **Subprocess enforcement on Linux.** macOS enforces `Profile.Subprocess` via SBPL `process-fork` / `process-exec*` denies. Linux bwrap does not gate subprocess spawning directly — namespace isolation prevents the sandboxed process from affecting the host, but it can still fork children inside the sandbox. A future iteration may add a seccomp filter for parity.
 
+## AllowLoopback
+
+`Profile.AllowLoopback` is an additive escape hatch for the MCP-on-loopback case: when `Net == false`, it still permits loopback traffic so the sandboxed child can talk to a parent-bound localhost server. When `Net == true`, the field is a no-op because the sandbox already has full network access.
+
+```go
+p := sandbox.Profile{
+    ID:             "mcp-loopback",
+    Net:            false,
+    AllowLoopback:  true,
+    Subprocess:     true,
+}
+```
+
+On macOS, the SBPL backend emits explicit localhost `allow` rules before the terminal `(deny network*)`, which covers the tested `127.0.0.1` and `::1` paths under seatbelt's host-filter constraints. On Linux, the bwrap backend still uses `--unshare-net`; a small trampoline path brings `lo` UP inside the unshared namespace and then execs the real target, which preserves the existing non-loopback isolation story.
+
 ## Default-allow rationale
 
 Both backends are default-allow with selective denies, not default-deny.
@@ -94,6 +110,7 @@ The Linux bwrap backend ports rationale comments verbatim from nanite's `os_linu
 - **gap #1** — read-only mounts narrowed from blanket `--ro-bind / /` to a candidate set of `/usr`, `/lib*`, `/bin`, `/sbin`, `/etc/{alternatives,ssl,ca-certificates,resolv.conf,hosts,nsswitch.conf}`. `/home`, `/root`, `/var`, `/srv`, `/opt`, and dotfiles are deliberately not bound — they can contain SSH keys, AWS creds, shell history, and other secrets the agent must not see. See `bwrapRoBindCandidates` in `sandbox/apply_linux.go`.
 - **gap #2** — PID, IPC, UTS, cgroup, user namespaces always unshared so the sandboxed process cannot observe or interfere with host processes. `--unshare-user-try` degrades on hardened distros that disable unprivileged user namespaces; the rest are always available.
 - **gap #3** (partial) — network namespace unshared when `Profile.Net == false`. Full proxy-mediated egress is out of scope for v0; see "Out".
+- **loopback follow-up** — when `Profile.AllowLoopback == true` and `Profile.Net == false`, Linux still unshares the network namespace and raises only the namespace-local `lo` device before execing the target. This keeps non-loopback interfaces out of view while allowing parent-bound localhost services such as MCP bridges.
 - **gap #4** — `/tmp` replaced with a per-invocation `--tmpfs` so there is no cross-session leakage through shared `/tmp` files.
 - **gap #5** (partial) — `--die-with-parent` and `--new-session` prevent orphan escape and TTY hijacking.
 
@@ -130,7 +147,7 @@ go-sandbox/
 
 ## Lineage
 
-- **Public API** (`Profile{FS, Net, Subprocess, ID}`, `LoadProfile`, `LoadProfiles`) — extracted from `agent-mux/internal/sandbox/profile.go`.
+- **Public API** (`Profile{FS, Net, AllowLoopback, Subprocess, ID}`, `LoadProfile`, `LoadProfiles`) — extracted from `agent-mux/internal/sandbox/profile.go`.
 - **macOS impl + literal validator** — extracted from `nanite/internal/sandbox/os_darwin.go` (`validateSeatbeltLiteral`, seatbelt profile shape).
 - **Linux impl** — extracted from `nanite/internal/sandbox/os_linux.go` (narrowed mounts, namespace unsharing, conditional `--unshare-net`, `--die-with-parent`).
 - **Cleanup pattern** — extracted from nanite's `applyOSSandbox`; the earlier mux Apply leaked the temp profile file, do not regress.
