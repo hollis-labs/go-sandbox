@@ -31,6 +31,9 @@ type Profile struct {
 	FS          FSSpec `yaml:"fs"`
 	// Net controls outbound network access. false = deny all outbound.
 	Net bool `yaml:"net"`
+	// AllowLoopback permits loopback traffic to 127.0.0.0/8 and ::1 even
+	// when Net is false. It is a no-op when Net is true.
+	AllowLoopback bool `yaml:"allow_loopback"`
 	// Subprocess controls whether the session may spawn child processes
 	// beyond the agent binary itself. macOS enforces this via SBPL
 	// process-fork / process-exec* denies; Linux bwrap does not directly

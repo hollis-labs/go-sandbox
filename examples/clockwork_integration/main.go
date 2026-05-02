@@ -20,6 +20,7 @@ import (
 func main() {
 	workspace := flag.String("workspace", "", "absolute path to the task workspace")
 	allowNet := flag.Bool("net", false, "allow outbound network")
+	allowLoopback := flag.Bool("allow-loopback", false, "allow 127.0.0.0/8 and ::1 while --net=false")
 	flag.Parse()
 
 	if *workspace == "" {
@@ -35,8 +36,9 @@ func main() {
 			Read:  []string{"workspace"},
 			Deny:  []string{"${HOME}/.ssh", "${HOME}/.aws"},
 		},
-		Net:        *allowNet,
-		Subprocess: true,
+		Net:           *allowNet,
+		AllowLoopback: *allowLoopback,
+		Subprocess:    true,
 	}
 
 	cmd := exec.Command("/bin/sh", "-c", "echo running in sandbox; ls -la "+*workspace)
@@ -49,7 +51,7 @@ func main() {
 	}
 	defer cleanup()
 
-	fmt.Printf("running task under profile %q (net=%v)\n", p.ID, p.Net)
+	fmt.Printf("running task under profile %q (net=%v allow_loopback=%v)\n", p.ID, p.Net, p.AllowLoopback)
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("task failed: %v", err)
 	}

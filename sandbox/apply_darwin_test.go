@@ -115,6 +115,24 @@ func TestBuildSBPL_DenyNetwork(t *testing.T) {
 	}
 }
 
+func TestBuildSBPL_AllowLoopbackWhileNetFalse(t *testing.T) {
+	p := Profile{ID: "loopback", Net: false, AllowLoopback: true, Subprocess: true}
+	sbpl, err := BuildSBPL(p, "/tmp/ws/loopback")
+	if err != nil {
+		t.Fatalf("BuildSBPL: %v", err)
+	}
+	for _, want := range []string{
+		`(allow network-bind (local ip "localhost:*"))`,
+		`(allow network-inbound (local ip "localhost:*"))`,
+		`(allow network-outbound (remote ip "localhost:*"))`,
+		`(deny network*)`,
+	} {
+		if !strings.Contains(sbpl, want) {
+			t.Errorf("expected SBPL to contain %q\n%s", want, sbpl)
+		}
+	}
+}
+
 func TestBuildSBPL_AllowNetwork(t *testing.T) {
 	p := Profile{ID: "with-net", Net: true, Subprocess: true}
 	sbpl, err := BuildSBPL(p, "/tmp/ws/xyz")

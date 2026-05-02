@@ -67,6 +67,10 @@ var bwrapRoBindCandidates = []string{
 // p.Net == true keeps the sandbox in the host netns. See README "Out of
 // scope: network proxy subsystem".
 func BuildBwrapArgs(p Profile, workspace string) ([]string, error) {
+	return buildBwrapArgs(p, workspace, "")
+}
+
+func buildBwrapArgs(p Profile, workspace, helperPath string) ([]string, error) {
 	absWS, err := filepath.Abs(workspace)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace dir: %w", err)
@@ -80,6 +84,10 @@ func BuildBwrapArgs(p Profile, workspace string) ([]string, error) {
 		if _, statErr := os.Lstat(path); statErr == nil {
 			args = append(args, "--ro-bind", path, path)
 		}
+	}
+
+	if helperPath != "" && !pathVisibleInSandbox(helperPath, absWS, p) {
+		args = append(args, "--ro-bind", helperPath, helperPath)
 	}
 
 	// Workspace is the writable root; per-invocation /tmp avoids host leakage.
@@ -135,6 +143,44 @@ func BuildBwrapArgs(p Profile, workspace string) ([]string, error) {
 	return args, nil
 }
 
+func pathVisibleInSandbox(target, workspace string, p Profile) bool {
+	if pathWithinBind(target, workspace) {
+		return true
+	}
+
+	home, _ := os.UserHomeDir()
+	for _, candidate := range bwrapRoBindCandidates {
+		if _, err := os.Lstat(candidate); err != nil {
+			continue
+		}
+		if pathWithinBind(target, candidate) {
+			return true
+		}
+	}
+	for _, raw := range p.FS.Write {
+		if pathWithinBind(target, expandPathLinux(raw, workspace, home)) {
+			return true
+		}
+	}
+	for _, raw := range p.FS.Read {
+		if pathWithinBind(target, expandPathLinux(raw, workspace, home)) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithinBind(target, bindPath string) bool {
+	if target == bindPath {
+		return true
+	}
+	info, err := os.Lstat(bindPath)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	return strings.HasPrefix(target, bindPath+"/")
+}
+
 func expandPathLinux(raw, workspace, home string) string {
 	if raw == "workspace" {
 		return workspace
@@ -164,22 +210,52 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 		return nil, fmt.Errorf("bwrap not found: cannot enforce profile %q on this system (install bubblewrap)", p.ID)
 	}
 
-	bwrapArgs, err := BuildBwrapArgs(p, workspace)
+	origPath := cmd.Path
+	origArgs := cmd.Args[1:]
+	payloadPath := origPath
+	payloadArgs := origArgs
+
+	helperPath := ""
+	if p.AllowLoopback && !p.Net {
+		resolvedOrigPath := origPath
+		if !filepath.IsAbs(resolvedOrigPath) {
+			resolvedOrigPath, err = exec.LookPath(origPath)
+			if err != nil {
+				return nil, fmt.Errorf("resolve sandbox target %q: %w", origPath, err)
+			}
+		}
+		helperPath, err = os.Executable()
+		if err != nil {
+			return nil, fmt.Errorf("resolve loopback helper executable: %w", err)
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(helperPath); resolveErr == nil {
+			helperPath = resolved
+		}
+		payloadPath = helperPath
+		payloadArgs = append([]string{loopbackHelperArg, resolvedOrigPath}, origArgs...)
+		cmd.Env = append(inheritedEnv(cmd.Env), loopbackHelperEnv+"=1")
+	}
+
+	bwrapArgs, err := buildBwrapArgs(p, workspace, helperPath)
 	if err != nil {
 		return nil, err
 	}
 
-	origPath := cmd.Path
-	origArgs := cmd.Args[1:]
-
 	full := make([]string, 0, 1+len(bwrapArgs)+2+len(origArgs))
 	full = append(full, "bwrap")
 	full = append(full, bwrapArgs...)
-	full = append(full, "--", origPath)
-	full = append(full, origArgs...)
+	full = append(full, "--", payloadPath)
+	full = append(full, payloadArgs...)
 
 	cmd.Path = bwrapBin
 	cmd.Args = full
 
 	return func() {}, nil
+}
+
+func inheritedEnv(env []string) []string {
+	if env == nil {
+		return append([]string(nil), os.Environ()...)
+	}
+	return append([]string(nil), env...)
 }
