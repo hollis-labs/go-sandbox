@@ -6,7 +6,7 @@ It is the substrate library that consumers (`agent-mux`, `clockwork-manifold`, `
 
 ## Status
 
-v0 — extracted from production code in `agent-mux/internal/sandbox` and `nanite/internal/sandbox`, hardened against the audit findings recorded in `nanite/docs/audits/2026-04-10-sandbox-hardening.md`. The macOS SBPL literal validator and the Linux bwrap narrowed-mounts / namespace-unsharing posture are non-optional and covered by tests.
+v0.2.x — extracted from two sibling sandbox impls (the agent-broker `agent-mux` and the manifest runner `nanite`) and hardened against the findings of an internal sandbox hardening audit dated 2026-04-10 (`finding 06`, gaps #1–#5; summarised under "Hardening posture" below). The macOS SBPL literal validator and the Linux bwrap narrowed-mounts / namespace-unsharing posture are non-optional and covered by tests.
 
 ## Install
 
@@ -75,7 +75,7 @@ In:
 
 Out (intentionally):
 
-- **Network proxy subsystem.** Nanite's host-side allowlist proxy (~570 LOC + tests) stays in nanite. If more apps need allowlisted egress, extract a separate `go-egress-proxy` lib later — don't fold it into this one.
+- **Network proxy subsystem.** A host-side allowlist proxy already exists in one of the source projects (`nanite`) but stays there. If more apps need allowlisted egress, extract a separate `go-egress-proxy` lib later — don't fold it into this one.
 - **Default-deny posture.** Both source impls use default-allow with selective denies (see "Default-allow rationale" below). Tightening to default-deny requires a well-tested per-OS allowlist of the system paths, dyld caches, Mach services, XPC endpoints, and library directories every modern process implicitly needs. That's a separate sprint.
 - **Windows.** Neither source impl supports Windows. A non-`darwin` non-`linux` `Apply` returns a hard error — no silent downgrade.
 - **App vocabulary.** No FSM transitions, no executor tickets, no broker events, no plugin lifecycle. Apps translate raw `*exec.Cmd` invocations + this lib's `Apply` into their own primitives.
@@ -115,11 +115,11 @@ Both backends are default-allow with selective denies, not default-deny.
 
 The reasons differ slightly per platform but rhyme: a correct default-deny posture requires enumerating an OS-version-dependent allowlist of every system path, library directory, and IPC endpoint every modern process implicitly touches — dyld caches and Mach services on macOS, glibc/musl loader paths and ld.so.conf entries on Linux. Enumerating that list correctly across distros and OS versions is a significant ongoing maintenance burden, and a partial allowlist is worse than default-allow because it produces silent runtime failures rather than visible policy gaps.
 
-For v0 we accept default-allow + targeted denies for the principal threat surfaces (sensitive FS paths, network, subprocess) and document this clearly. Tightening is its own future sprint.
+For v0.2.x we accept default-allow + targeted denies for the principal threat surfaces (sensitive FS paths, network, subprocess) and document this clearly. Tightening is its own future sprint.
 
 ## Hardening posture (audit-trace)
 
-The Linux bwrap backend ports rationale comments verbatim from nanite's `os_linux.go`, which were authored against the **2026-04-10 sandbox hardening audit** (`finding 06`, gaps #1–#5):
+The Linux bwrap backend's rationale comments were authored against an internal **2026-04-10 sandbox hardening audit** (`finding 06`, gaps #1–#5). The audit document itself lives in a private repo, but the gaps it called out and the mitigations are summarised here:
 
 - **gap #1** — read-only mounts narrowed from blanket `--ro-bind / /` to a candidate set of `/usr`, `/lib*`, `/bin`, `/sbin`, `/etc/{alternatives,ssl,ca-certificates,resolv.conf,hosts,nsswitch.conf}`. `/home`, `/root`, `/var`, `/srv`, `/opt`, and dotfiles are deliberately not bound — they can contain SSH keys, AWS creds, shell history, and other secrets the agent must not see. See `bwrapRoBindCandidates` in `sandbox/apply_linux.go`.
 - **gap #2** — PID, IPC, UTS, cgroup, user namespaces always unshared so the sandboxed process cannot observe or interfere with host processes. `--unshare-user-try` degrades on hardened distros that disable unprivileged user namespaces; the rest are always available.
@@ -161,11 +161,13 @@ go-sandbox/
 
 ## Lineage
 
-- **Public API** (`Profile{FS, Net, AllowLoopback, LoopbackForwardPorts, Subprocess, ID}`, `LoadProfile`, `LoadProfiles`) — extracted from `agent-mux/internal/sandbox/profile.go`.
-- **macOS impl + literal validator** — extracted from `nanite/internal/sandbox/os_darwin.go` (`validateSeatbeltLiteral`, seatbelt profile shape).
-- **Linux impl** — extracted from `nanite/internal/sandbox/os_linux.go` (narrowed mounts, namespace unsharing, conditional `--unshare-net`, `--die-with-parent`).
-- **Cleanup pattern** — extracted from nanite's `applyOSSandbox`; the earlier mux Apply leaked the temp profile file, do not regress.
-- **`internal/pathsafe`** — verbatim port of `nanite/internal/pathsafe`; not re-exported, not a dependency on nanite.
+This package is a hybrid extraction from two sibling sandbox implementations (currently in private repos), reconciled into a single public substrate:
+
+- **Public API** (`Profile{FS, Net, AllowLoopback, LoopbackForwardPorts, Subprocess, ID}`, `LoadProfile`, `LoadProfiles`) — taken from `agent-mux`'s sandbox package (the broker-side Profile shape).
+- **macOS backend + literal validator** — taken from `nanite`'s darwin sandbox impl (`validateSeatbeltLiteral`, seatbelt profile shape).
+- **Linux backend** — taken from `nanite`'s linux sandbox impl (narrowed mounts, namespace unsharing, conditional `--unshare-net`, `--die-with-parent`).
+- **Cleanup pattern** — taken from `nanite`'s `applyOSSandbox`. The earlier mux `Apply` leaked the temp profile file on darwin; the cleanup-function return added here closes that, and the regression is covered by tests — do not regress it.
+- **`internal/pathsafe`** — verbatim port of `nanite`'s internal `pathsafe` helper; kept internal and not re-exported.
 
 ## License
 
