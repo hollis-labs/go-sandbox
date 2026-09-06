@@ -6,7 +6,7 @@ It is the substrate library that consumers (`agent-mux`, `clockwork-manifold`, `
 
 ## Status
 
-v0.3-in-progress — keeps the legacy `Profile` / `Apply` API and adds explicit resolved access policy contracts for shared materialization and prepared launch flows. Resolved policies can be applied on macOS through SBPL and on Linux through bubblewrap. The macOS SBPL literal validator and the Linux bwrap narrowed-mounts / namespace-unsharing posture remain non-optional and covered by tests.
+v0.3.0 — keeps the legacy `Profile` / `Apply` API and adds explicit resolved access policy contracts for shared materialization and prepared launch flows. Resolved policies can be applied on macOS through SBPL and on Linux through bubblewrap. The macOS SBPL literal validator and the Linux bwrap narrowed-mounts / namespace-unsharing posture remain non-optional and covered by tests.
 
 ## Install
 

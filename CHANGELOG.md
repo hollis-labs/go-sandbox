@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.3.0 — 2026-09-06
+
+- Add resolved filesystem, network and subprocess access policies, backend
+  capability reporting and explicit enforcement outcomes.
+- Enforce macOS filesystem allowlists and deny rules through SBPL; reject
+  required policy combinations that cannot be enforced before process start.
+- Add Linux bubblewrap resolved-policy enforcement with restricted mounts,
+  private networking and explicit loopback forwarding.
+- Preserve the legacy `Profile` / `Apply` entry points and add behavioral
+  tests for read/write denial, unavailable backends and policy propagation.
+
 ## v0.2.1 — 2026-05-10
 
 - Docs: public-release polish — refreshed `Status` section to reflect the
