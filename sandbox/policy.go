@@ -1,0 +1,866 @@
+package sandbox
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+
+	"github.com/hollis-labs/go-sandbox/internal/pathsafe"
+)
+
+// ConfinementMode declares whether OS confinement is mandatory or explicitly
+// disabled for a launch.
+type ConfinementMode string
+
+const (
+	// ConfinementRequired means the child must not start unless the selected
+	// backend can enforce every requested capability.
+	ConfinementRequired ConfinementMode = "required"
+	// ConfinementDisabled is an explicit unconfined launch. It is represented
+	// in outcomes so callers do not mistake it for applied enforcement.
+	ConfinementDisabled ConfinementMode = "disabled"
+)
+
+// RootName identifies one of the concrete launch roots used by access policy.
+type RootName string
+
+const (
+	ProjectRoot RootName = "project"
+	BootRoot    RootName = "boot"
+	StateRoot   RootName = "state"
+	ScratchRoot RootName = "scratch"
+	CWDRoot     RootName = "cwd"
+)
+
+// Roots names concrete filesystem roots independently from the process cwd.
+// Empty optional roots may not be referenced by PathRef.
+type Roots struct {
+	Project string
+	Boot    string
+	State   string
+	Scratch string
+	CWD     string
+}
+
+// PathRef names either an absolute path (when Root is empty) or a path under
+// one of Roots. Relative defaults to ".".
+type PathRef struct {
+	Root     RootName
+	Relative string
+	Path     string
+}
+
+// FilesystemAccess is the child process filesystem policy. Deny rules always
+// take precedence over read and write grants. SourceRead entries are resolved
+// and recorded for provenance, but are not child execution grants.
+type FilesystemAccess struct {
+	Read       []PathRef
+	Write      []PathRef
+	Deny       []PathRef
+	SourceRead []PathRef
+}
+
+// RuntimeAccess declares host runtime files the backend must make readable,
+// such as an executable, dynamic loader support files or language runtimes.
+type RuntimeAccess struct {
+	Executable PathRef
+	Read       []PathRef
+}
+
+// ProviderStateAccess declares provider-owned mutable state needed at runtime.
+type ProviderStateAccess struct {
+	Read  []PathRef
+	Write []PathRef
+}
+
+// ScratchAccess declares whether the private scratch root is writable inside
+// the sandbox. The root itself is Roots.Scratch.
+type ScratchAccess struct {
+	Writable bool
+}
+
+// NetworkMode declares the requested network shape.
+type NetworkMode string
+
+const (
+	NetworkDeny     NetworkMode = "deny"
+	NetworkLoopback NetworkMode = "loopback"
+	NetworkFull     NetworkMode = "full"
+)
+
+// NetworkAccess declares network requirements. LoopbackPorts are host
+// localhost TCP ports that must be bridged when the backend uses a private
+// network namespace.
+type NetworkAccess struct {
+	Mode          NetworkMode
+	LoopbackPorts []int
+}
+
+// SubprocessMode declares child process spawning behavior after the initial
+// sandboxed process starts.
+type SubprocessMode string
+
+const (
+	SubprocessAllow SubprocessMode = "allow"
+	SubprocessDeny  SubprocessMode = "deny"
+)
+
+// BackendName identifies an enforcement backend.
+type BackendName string
+
+const (
+	BackendAuto           BackendName = "auto"
+	BackendNone           BackendName = "none"
+	BackendDarwinSeatbelt BackendName = "darwin-seatbelt"
+	BackendLinuxBwrap     BackendName = "linux-bwrap"
+)
+
+// LegacyCompatibility records that a policy came from the legacy Profile /
+// SandboxProfile shape. Legacy profiles are default-allow with selective
+// denies on some backends; callers must not label them workspace-confined.
+type LegacyCompatibility struct {
+	Enabled      bool
+	Source       string
+	DefaultAllow bool
+}
+
+// AccessPolicy is the caller-authored sandbox request.
+type AccessPolicy struct {
+	ID            string
+	Mode          ConfinementMode
+	Backend       BackendName
+	Roots         Roots
+	FS            FilesystemAccess
+	Runtime       RuntimeAccess
+	ProviderState ProviderStateAccess
+	Scratch       ScratchAccess
+	Network       NetworkAccess
+	Subprocess    SubprocessMode
+	Legacy        LegacyCompatibility
+}
+
+// ResolvedRoots contains absolute, symlink-normalized root paths.
+type ResolvedRoots struct {
+	Project string
+	Boot    string
+	State   string
+	Scratch string
+	CWD     string
+}
+
+// AccessKind identifies why a path is visible to the child.
+type AccessKind string
+
+const (
+	AccessRead        AccessKind = "read"
+	AccessWrite       AccessKind = "write"
+	AccessDeny        AccessKind = "deny"
+	AccessSourceRead  AccessKind = "source-read"
+	AccessRuntimeRead AccessKind = "runtime-read"
+)
+
+// ResolvedPath is a normalized access rule.
+type ResolvedPath struct {
+	Kind   AccessKind
+	Root   RootName
+	Path   string
+	Source string
+}
+
+// ResolvedFilesystemAccess is the concrete filesystem policy. Write grants
+// imply read access. Deny grants override both read and write.
+type ResolvedFilesystemAccess struct {
+	Read       []ResolvedPath
+	Write      []ResolvedPath
+	Deny       []ResolvedPath
+	SourceRead []ResolvedPath
+}
+
+// ResolvedAccessPolicy is the normalized sandbox request consumed by backend
+// capability checks and later backend emitters.
+type ResolvedAccessPolicy struct {
+	ID            string
+	Mode          ConfinementMode
+	Backend       BackendName
+	Roots         ResolvedRoots
+	FS            ResolvedFilesystemAccess
+	Runtime       []ResolvedPath
+	ProviderState ResolvedFilesystemAccess
+	Scratch       []ResolvedPath
+	Network       NetworkAccess
+	Subprocess    SubprocessMode
+	Legacy        LegacyCompatibility
+}
+
+// AccessDecision is the effective child access for a path after deny
+// precedence and write-implies-read rules are applied.
+type AccessDecision string
+
+const (
+	AccessDenied    AccessDecision = "denied"
+	AccessReadOnly  AccessDecision = "read-only"
+	AccessReadWrite AccessDecision = "read-write"
+	AccessNoGrant   AccessDecision = "no-grant"
+)
+
+// ResolveAccessPolicy validates and normalizes an AccessPolicy without
+// consulting the host backend. It never converts SourceRead into execution
+// grants and never derives roots from the process cwd.
+func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
+	if p.ID == "" {
+		return ResolvedAccessPolicy{}, errors.New("sandbox: access policy id is required")
+	}
+	if p.Mode == "" {
+		p.Mode = ConfinementRequired
+	}
+	if p.Mode != ConfinementRequired && p.Mode != ConfinementDisabled {
+		return ResolvedAccessPolicy{}, fmt.Errorf("sandbox: unsupported confinement mode %q", p.Mode)
+	}
+	if p.Backend == "" {
+		p.Backend = BackendAuto
+	}
+	switch p.Backend {
+	case BackendAuto, BackendNone, BackendDarwinSeatbelt, BackendLinuxBwrap:
+	default:
+		return ResolvedAccessPolicy{}, fmt.Errorf("sandbox: unsupported backend %q", p.Backend)
+	}
+	if p.Network.Mode == "" {
+		p.Network.Mode = NetworkDeny
+	}
+	switch p.Network.Mode {
+	case NetworkDeny, NetworkLoopback, NetworkFull:
+	default:
+		return ResolvedAccessPolicy{}, fmt.Errorf("sandbox: unsupported network mode %q", p.Network.Mode)
+	}
+	if p.Subprocess == "" {
+		p.Subprocess = SubprocessAllow
+	}
+	switch p.Subprocess {
+	case SubprocessAllow, SubprocessDeny:
+	default:
+		return ResolvedAccessPolicy{}, fmt.Errorf("sandbox: unsupported subprocess mode %q", p.Subprocess)
+	}
+	if err := validateLoopbackPortSet(p.Network.LoopbackPorts); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+
+	roots, err := resolveRoots(p.Roots)
+	if err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	resolved := ResolvedAccessPolicy{
+		ID:         p.ID,
+		Mode:       p.Mode,
+		Backend:    p.Backend,
+		Roots:      roots,
+		Network:    NetworkAccess{Mode: p.Network.Mode, LoopbackPorts: slices.Clone(p.Network.LoopbackPorts)},
+		Subprocess: p.Subprocess,
+		Legacy:     p.Legacy,
+	}
+
+	if resolved.FS.Read, err = resolvePathRefs(AccessRead, p.FS.Read, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if resolved.FS.Write, err = resolvePathRefs(AccessWrite, p.FS.Write, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if resolved.FS.Deny, err = resolvePathRefs(AccessDeny, p.FS.Deny, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if resolved.FS.SourceRead, err = resolvePathRefs(AccessSourceRead, p.FS.SourceRead, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+
+	if p.Runtime.Executable != (PathRef{}) {
+		exe, err := resolvePathRef(AccessRuntimeRead, p.Runtime.Executable, roots)
+		if err != nil {
+			return ResolvedAccessPolicy{}, err
+		}
+		resolved.Runtime = append(resolved.Runtime, exe)
+	}
+	runtimeReads, err := resolvePathRefs(AccessRuntimeRead, p.Runtime.Read, roots)
+	if err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	resolved.Runtime = append(resolved.Runtime, runtimeReads...)
+
+	if resolved.ProviderState.Read, err = resolvePathRefs(AccessRead, p.ProviderState.Read, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if resolved.ProviderState.Write, err = resolvePathRefs(AccessWrite, p.ProviderState.Write, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if p.Scratch.Writable {
+		if roots.Scratch == "" {
+			return ResolvedAccessPolicy{}, errors.New("sandbox: scratch access requested without scratch root")
+		}
+		resolved.Scratch = []ResolvedPath{{
+			Kind:   AccessWrite,
+			Root:   ScratchRoot,
+			Path:   roots.Scratch,
+			Source: "scratch",
+		}}
+	}
+
+	sortResolvedPolicy(&resolved)
+	return resolved, nil
+}
+
+// AccessFor returns the effective child filesystem access for path. It is a
+// policy decision helper; actual OS enforcement is backend-specific.
+func (p ResolvedAccessPolicy) AccessFor(path string) AccessDecision {
+	resolved, err := canonicalPath(path)
+	if err != nil {
+		return AccessNoGrant
+	}
+	if containsPath(p.allDenies(), resolved) {
+		return AccessDenied
+	}
+	if containsPath(p.allWrites(), resolved) {
+		return AccessReadWrite
+	}
+	if containsPath(p.allReads(), resolved) {
+		return AccessReadOnly
+	}
+	return AccessNoGrant
+}
+
+// LegacyProfile converts a resolved policy into the legacy Profile shape. This
+// is a compatibility bridge for existing Apply callers and may lose future
+// policy detail; new code should pass the resolved policy to backend-aware
+// launch plumbing once available.
+func (p ResolvedAccessPolicy) LegacyProfile() Profile {
+	profile := Profile{
+		ID:                   p.ID,
+		Description:          "generated from resolved access policy",
+		Net:                  p.Network.Mode == NetworkFull,
+		AllowLoopback:        p.Network.Mode == NetworkLoopback,
+		LoopbackForwardPorts: slices.Clone(p.Network.LoopbackPorts),
+		Subprocess:           p.Subprocess != SubprocessDeny,
+	}
+	for _, item := range p.allReads() {
+		profile.FS.Read = append(profile.FS.Read, item.Path)
+	}
+	for _, item := range p.allWrites() {
+		profile.FS.Write = append(profile.FS.Write, item.Path)
+	}
+	for _, item := range p.allDenies() {
+		profile.FS.Deny = append(profile.FS.Deny, item.Path)
+	}
+	return profile
+}
+
+// PolicyFromProfile adapts the legacy Profile / SandboxProfile shape. The
+// workspace token becomes Project, Boot, State, Scratch and CWD only because
+// the old API had one root parameter. Legacy.DefaultAllow marks the semantic
+// gap so callers do not describe this as strict workspace confinement.
+func PolicyFromProfile(p Profile, workspace string) AccessPolicy {
+	roots := Roots{
+		Project: workspace,
+		Boot:    workspace,
+		State:   workspace,
+		Scratch: workspace,
+		CWD:     workspace,
+	}
+	return AccessPolicy{
+		ID:      p.ID,
+		Mode:    ConfinementRequired,
+		Backend: BackendAuto,
+		Roots:   roots,
+		FS: FilesystemAccess{
+			Read:  pathRefsFromLegacy(p.FS.Read),
+			Write: pathRefsFromLegacy(p.FS.Write),
+			Deny:  pathRefsFromLegacy(p.FS.Deny),
+		},
+		Network: NetworkAccess{
+			Mode:          legacyNetworkMode(p),
+			LoopbackPorts: slices.Clone(p.LoopbackForwardPorts),
+		},
+		Subprocess: legacySubprocessMode(p),
+		Legacy: LegacyCompatibility{
+			Enabled:      true,
+			Source:       "Profile",
+			DefaultAllow: true,
+		},
+	}
+}
+
+// Capability identifies an enforcement capability a backend may provide.
+type Capability string
+
+const (
+	CapFilesystemAllowlist Capability = "filesystem-allowlist"
+	CapDenyPrecedence      Capability = "deny-precedence"
+	CapRuntimeReads        Capability = "runtime-reads"
+	CapProviderState       Capability = "provider-state"
+	CapScratch             Capability = "scratch"
+	CapNetworkDeny         Capability = "network-deny"
+	CapLoopback            Capability = "loopback"
+	CapLoopbackForward     Capability = "loopback-forward"
+	CapSubprocessDeny      Capability = "subprocess-deny"
+	CapDisabledMode        Capability = "disabled-mode"
+)
+
+// BackendCapabilities reports what a selected backend can honestly enforce.
+type BackendCapabilities struct {
+	Backend      BackendName
+	GOOS         string
+	Supported    bool
+	Capabilities []Capability
+	Reason       string
+}
+
+// ResolveBackendCapabilities selects a backend for goos and reports known
+// capabilities. Pass goos="" to use runtime.GOOS.
+func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapabilities {
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	if requested == "" || requested == BackendAuto {
+		switch goos {
+		case "darwin":
+			requested = BackendDarwinSeatbelt
+		case "linux":
+			requested = BackendLinuxBwrap
+		default:
+			requested = BackendNone
+		}
+	}
+	caps := BackendCapabilities{Backend: requested, GOOS: goos}
+	switch requested {
+	case BackendNone:
+		caps.Supported = true
+		caps.Capabilities = []Capability{CapDisabledMode}
+	case BackendDarwinSeatbelt:
+		caps.Supported = goos == "darwin"
+		caps.Capabilities = []Capability{
+			CapFilesystemAllowlist,
+			CapDenyPrecedence,
+			CapRuntimeReads,
+			CapProviderState,
+			CapScratch,
+			CapNetworkDeny,
+			CapLoopback,
+		}
+	case BackendLinuxBwrap:
+		caps.Supported = goos == "linux"
+		caps.Capabilities = []Capability{
+			CapFilesystemAllowlist,
+			CapDenyPrecedence,
+			CapRuntimeReads,
+			CapProviderState,
+			CapScratch,
+			CapNetworkDeny,
+			CapLoopback,
+			CapLoopbackForward,
+		}
+	default:
+		caps.Supported = false
+		caps.Reason = "unknown backend"
+	}
+	if !caps.Supported && caps.Reason == "" {
+		caps.Reason = fmt.Sprintf("%s is unsupported on %s", requested, goos)
+	}
+	return caps
+}
+
+// EnforcementState summarizes the actual enforcement status of a launch.
+type EnforcementState string
+
+const (
+	EnforcementConfigured  EnforcementState = "configured"
+	EnforcementDisabled    EnforcementState = "disabled"
+	EnforcementUnsupported EnforcementState = "unsupported"
+	EnforcementApplied     EnforcementState = "applied"
+	EnforcementFailed      EnforcementState = "failed"
+)
+
+// EnforcementOutcome distinguishes requested policy, selected backend and
+// actual launch status. Applied should be used only after backend wrapping has
+// succeeded for the child process about to start.
+type EnforcementOutcome struct {
+	PolicyID     string
+	Mode         ConfinementMode
+	Backend      BackendName
+	State        EnforcementState
+	Enforced     bool
+	Disabled     bool
+	Unsupported  []Capability
+	Diagnostics  []string
+	BackendGOOS  string
+	BackendReady bool
+}
+
+// AssessEnforcement checks whether caps can enforce p. It fails closed for
+// required confinement and reports disabled mode honestly.
+func AssessEnforcement(p ResolvedAccessPolicy, caps BackendCapabilities) EnforcementOutcome {
+	out := EnforcementOutcome{
+		PolicyID:     p.ID,
+		Mode:         p.Mode,
+		Backend:      caps.Backend,
+		BackendGOOS:  caps.GOOS,
+		BackendReady: caps.Supported,
+	}
+	if p.Mode == ConfinementDisabled {
+		out.State = EnforcementDisabled
+		out.Disabled = true
+		out.Diagnostics = append(out.Diagnostics, "confinement explicitly disabled")
+		return out
+	}
+	if !caps.Supported {
+		out.State = EnforcementUnsupported
+		out.Diagnostics = append(out.Diagnostics, caps.Reason)
+		return out
+	}
+
+	required := requiredCapabilities(p)
+	if len(required) == 0 {
+		out.State = EnforcementUnsupported
+		out.Diagnostics = append(out.Diagnostics, "required confinement has no enforceable requirements")
+		return out
+	}
+	for _, cap := range required {
+		if !slices.Contains(caps.Capabilities, cap) {
+			out.Unsupported = append(out.Unsupported, cap)
+		}
+	}
+	if len(out.Unsupported) > 0 {
+		out.State = EnforcementUnsupported
+		for _, cap := range out.Unsupported {
+			out.Diagnostics = append(out.Diagnostics, fmt.Sprintf("backend %s lacks %s", caps.Backend, cap))
+		}
+		return out
+	}
+	out.State = EnforcementConfigured
+	return out
+}
+
+// AppliedOutcome marks a configured outcome as applied after backend wrapping
+// succeeds. It never upgrades disabled or unsupported outcomes.
+func AppliedOutcome(out EnforcementOutcome) EnforcementOutcome {
+	if out.State == EnforcementConfigured {
+		out.State = EnforcementApplied
+		out.Enforced = true
+	}
+	return out
+}
+
+func resolveRoots(roots Roots) (ResolvedRoots, error) {
+	project, err := requiredRoot(ProjectRoot, roots.Project)
+	if err != nil {
+		return ResolvedRoots{}, err
+	}
+	cwdRaw := roots.CWD
+	if cwdRaw == "" {
+		cwdRaw = roots.Project
+	}
+	cwd, err := canonicalPath(cwdRaw)
+	if err != nil {
+		return ResolvedRoots{}, fmt.Errorf("sandbox: resolve cwd root: %w", err)
+	}
+	out := ResolvedRoots{Project: project, CWD: cwd}
+	if roots.Boot != "" {
+		if out.Boot, err = canonicalPath(roots.Boot); err != nil {
+			return ResolvedRoots{}, fmt.Errorf("sandbox: resolve boot root: %w", err)
+		}
+	}
+	if roots.State != "" {
+		if out.State, err = canonicalPath(roots.State); err != nil {
+			return ResolvedRoots{}, fmt.Errorf("sandbox: resolve state root: %w", err)
+		}
+	}
+	if roots.Scratch != "" {
+		if out.Scratch, err = canonicalPath(roots.Scratch); err != nil {
+			return ResolvedRoots{}, fmt.Errorf("sandbox: resolve scratch root: %w", err)
+		}
+	}
+	return out, nil
+}
+
+func requiredRoot(name RootName, path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("sandbox: %s root is required", name)
+	}
+	root, err := canonicalPath(path)
+	if err != nil {
+		return "", fmt.Errorf("sandbox: resolve %s root: %w", name, err)
+	}
+	return root, nil
+}
+
+func resolvePathRefs(kind AccessKind, refs []PathRef, roots ResolvedRoots) ([]ResolvedPath, error) {
+	out := make([]ResolvedPath, 0, len(refs))
+	for _, ref := range refs {
+		resolved, err := resolvePathRef(kind, ref, roots)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, resolved)
+	}
+	return out, nil
+}
+
+func resolvePathRef(kind AccessKind, ref PathRef, roots ResolvedRoots) (ResolvedPath, error) {
+	if ref.Root == "" {
+		if ref.Path == "" {
+			return ResolvedPath{}, fmt.Errorf("sandbox: %s path ref needs root or path", kind)
+		}
+		path, err := canonicalPath(ref.Path)
+		if err != nil {
+			return ResolvedPath{}, fmt.Errorf("sandbox: resolve %s path %q: %w", kind, ref.Path, err)
+		}
+		return ResolvedPath{Kind: kind, Path: path, Source: ref.Path}, nil
+	}
+	root, err := rootPath(roots, ref.Root)
+	if err != nil {
+		return ResolvedPath{}, err
+	}
+	rel := ref.Relative
+	if rel == "" {
+		rel = "."
+	}
+	path, err := pathsafe.ResolveUnder(root, rel)
+	if err != nil {
+		return ResolvedPath{}, fmt.Errorf("sandbox: resolve %s under %s: %w", kind, ref.Root, err)
+	}
+	return ResolvedPath{Kind: kind, Root: ref.Root, Path: path, Source: rel}, nil
+}
+
+func rootPath(roots ResolvedRoots, name RootName) (string, error) {
+	switch name {
+	case ProjectRoot:
+		return roots.Project, nil
+	case BootRoot:
+		if roots.Boot == "" {
+			return "", errors.New("sandbox: boot root is not configured")
+		}
+		return roots.Boot, nil
+	case StateRoot:
+		if roots.State == "" {
+			return "", errors.New("sandbox: state root is not configured")
+		}
+		return roots.State, nil
+	case ScratchRoot:
+		if roots.Scratch == "" {
+			return "", errors.New("sandbox: scratch root is not configured")
+		}
+		return roots.Scratch, nil
+	case CWDRoot:
+		return roots.CWD, nil
+	default:
+		return "", fmt.Errorf("sandbox: unknown root %q", name)
+	}
+}
+
+func canonicalPath(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("empty path")
+	}
+	if strings.ContainsRune(path, 0) {
+		return "", errors.New("null byte in path")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return resolveSymlinksBestEffortPolicy(abs)
+}
+
+func resolveSymlinksBestEffortPolicy(path string) (string, error) {
+	path = filepath.Clean(path)
+	if evald, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(evald), nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	dir := path
+	var suffix []string
+	for {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return path, nil
+		}
+		suffix = append([]string{filepath.Base(dir)}, suffix...)
+		dir = parent
+		if info, err := os.Lstat(dir); err == nil {
+			if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				return "", fmt.Errorf("ancestor %q is not a directory", dir)
+			}
+			evald, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(append([]string{evald}, suffix...)...), nil
+		}
+	}
+}
+
+func containsPath(paths []ResolvedPath, target string) bool {
+	for _, item := range paths {
+		if pathContains(item.Path, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathContains(parent, child string) bool {
+	parent = filepath.Clean(parent)
+	child = filepath.Clean(child)
+	if parent == child {
+		return true
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err != nil || rel == "." || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func (p ResolvedAccessPolicy) allReads() []ResolvedPath {
+	out := append([]ResolvedPath{}, p.FS.Read...)
+	out = append(out, p.Runtime...)
+	out = append(out, p.ProviderState.Read...)
+	return out
+}
+
+func (p ResolvedAccessPolicy) allWrites() []ResolvedPath {
+	out := append([]ResolvedPath{}, p.FS.Write...)
+	out = append(out, p.ProviderState.Write...)
+	out = append(out, p.Scratch...)
+	return out
+}
+
+func (p ResolvedAccessPolicy) allDenies() []ResolvedPath {
+	return append([]ResolvedPath{}, p.FS.Deny...)
+}
+
+func sortResolvedPolicy(p *ResolvedAccessPolicy) {
+	sortPaths := func(paths []ResolvedPath) {
+		slices.SortFunc(paths, func(a, b ResolvedPath) int {
+			if a.Path < b.Path {
+				return -1
+			}
+			if a.Path > b.Path {
+				return 1
+			}
+			if a.Kind < b.Kind {
+				return -1
+			}
+			if a.Kind > b.Kind {
+				return 1
+			}
+			return 0
+		})
+	}
+	sortPaths(p.FS.Read)
+	sortPaths(p.FS.Write)
+	sortPaths(p.FS.Deny)
+	sortPaths(p.FS.SourceRead)
+	sortPaths(p.Runtime)
+	sortPaths(p.ProviderState.Read)
+	sortPaths(p.ProviderState.Write)
+	sortPaths(p.Scratch)
+	slices.Sort(p.Network.LoopbackPorts)
+}
+
+func validateLoopbackPortSet(ports []int) error {
+	seen := map[int]struct{}{}
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("sandbox: invalid loopback port %d", port)
+		}
+		if _, ok := seen[port]; ok {
+			return fmt.Errorf("sandbox: duplicate loopback port %d", port)
+		}
+		seen[port] = struct{}{}
+	}
+	return nil
+}
+
+func requiredCapabilities(p ResolvedAccessPolicy) []Capability {
+	var caps []Capability
+	add := func(cap Capability) {
+		if !slices.Contains(caps, cap) {
+			caps = append(caps, cap)
+		}
+	}
+	if len(p.FS.Read) > 0 || len(p.FS.Write) > 0 {
+		add(CapFilesystemAllowlist)
+	}
+	if len(p.FS.Deny) > 0 {
+		add(CapDenyPrecedence)
+	}
+	if len(p.Runtime) > 0 {
+		add(CapRuntimeReads)
+		add(CapFilesystemAllowlist)
+	}
+	if len(p.ProviderState.Read) > 0 || len(p.ProviderState.Write) > 0 {
+		add(CapProviderState)
+		add(CapFilesystemAllowlist)
+	}
+	if len(p.Scratch) > 0 {
+		add(CapScratch)
+		add(CapFilesystemAllowlist)
+	}
+	switch p.Network.Mode {
+	case NetworkDeny:
+		add(CapNetworkDeny)
+	case NetworkLoopback:
+		add(CapNetworkDeny)
+		add(CapLoopback)
+		if len(p.Network.LoopbackPorts) > 0 {
+			add(CapLoopbackForward)
+		}
+	}
+	if p.Subprocess == SubprocessDeny {
+		add(CapSubprocessDeny)
+	}
+	return caps
+}
+
+func pathRefsFromLegacy(paths []string) []PathRef {
+	refs := make([]PathRef, 0, len(paths))
+	for _, path := range paths {
+		if path == "workspace" {
+			refs = append(refs, PathRef{Root: ProjectRoot})
+			continue
+		}
+		refs = append(refs, PathRef{Path: expandLegacyPath(path)})
+	}
+	return refs
+}
+
+func expandLegacyPath(raw string) string {
+	home, _ := os.UserHomeDir()
+	raw = strings.ReplaceAll(raw, "${HOME}", home)
+	if raw == "~" {
+		return home
+	}
+	if strings.HasPrefix(raw, "~/") {
+		return home + raw[1:]
+	}
+	return raw
+}
+
+func legacyNetworkMode(p Profile) NetworkMode {
+	if p.Net {
+		return NetworkFull
+	}
+	if p.AllowLoopback || len(p.LoopbackForwardPorts) > 0 {
+		return NetworkLoopback
+	}
+	return NetworkDeny
+}
+
+func legacySubprocessMode(p Profile) SubprocessMode {
+	if p.Subprocess {
+		return SubprocessAllow
+	}
+	return SubprocessDeny
+}

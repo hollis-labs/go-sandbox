@@ -86,11 +86,19 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 	args := make([]string, 0, 32)
 
 	// Narrowed read-only mounts (gap #1). Missing paths are skipped so
-	// different distros (musl/glibc, multiarch/single-arch) all work.
+	// different distros (musl/glibc, multiarch/single-arch) all work. Linux
+	// compatibility symlink paths are preserved so ELF interpreters that refer
+	// to /lib or payloads that refer to /bin continue to resolve.
 	for _, path := range bwrapRoBindCandidates {
 		if _, statErr := os.Lstat(path); statErr == nil {
-			args = append(args, "--ro-bind", path, path)
+			args = append(args, "--ro-bind", filepath.Clean(path), filepath.Clean(path))
 		}
+	}
+
+	home, _ := os.UserHomeDir()
+	args = append(args, "--tmpfs", "/tmp")
+	for _, dir := range legacyBwrapMountParentDirs(absWS, p, helperPath, bridgeDir, home) {
+		args = append(args, "--dir", dir)
 	}
 
 	if helperPath != "" && !pathVisibleInSandbox(helperPath, absWS, p) {
@@ -103,13 +111,11 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 	// Workspace is the writable root; per-invocation /tmp avoids host leakage.
 	args = append(args,
 		"--bind", absWS, absWS,
-		"--tmpfs", "/tmp",
 		"--dev", "/dev",
 		"--proc", "/proc",
 	)
 
 	// Additional Write paths.
-	home, _ := os.UserHomeDir()
 	seen := map[string]bool{absWS: true}
 	for _, raw := range p.FS.Write {
 		path := expandPathLinux(raw, absWS, home)
@@ -151,6 +157,35 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 	}
 
 	return args, nil
+}
+
+func legacyBwrapMountParentDirs(workspace string, p Profile, helperPath, bridgeDir, home string) []string {
+	seen := map[string]bool{"/": true}
+	var dirs []string
+	addForPath := func(path string) {
+		for _, dir := range parentDirsForBwrap(path) {
+			if seen[dir] {
+				continue
+			}
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	addForPath(workspace)
+	if helperPath != "" {
+		addForPath(helperPath)
+	}
+	if bridgeDir != "" {
+		addForPath(bridgeDir)
+	}
+	for _, raw := range p.FS.Write {
+		addForPath(expandPathLinux(raw, workspace, home))
+	}
+	for _, raw := range p.FS.Read {
+		addForPath(expandPathLinux(raw, workspace, home))
+	}
+	slices.Sort(dirs)
+	return dirs
 }
 
 func pathVisibleInSandbox(target, workspace string, p Profile) bool {
@@ -263,11 +298,30 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 		}
 	}
 
+	payloadBindPath := helperPath
+	if payloadBindPath == "" {
+		resolvedPayloadPath := payloadPath
+		if !filepath.IsAbs(resolvedPayloadPath) {
+			if lookedUp, lookErr := exec.LookPath(resolvedPayloadPath); lookErr == nil {
+				resolvedPayloadPath = lookedUp
+			}
+		}
+		if filepath.IsAbs(resolvedPayloadPath) {
+			if resolved, resolveErr := filepath.EvalSymlinks(resolvedPayloadPath); resolveErr == nil {
+				resolvedPayloadPath = resolved
+			}
+			if !pathVisibleInSandbox(resolvedPayloadPath, workspace, p) {
+				payloadBindPath = resolvedPayloadPath
+				payloadPath = resolvedPayloadPath
+			}
+		}
+	}
+
 	bridgeDir := ""
 	if bridge != nil {
 		bridgeDir = bridge.dir
 	}
-	bwrapArgs, err := buildBwrapArgs(p, workspace, helperPath, bridgeDir)
+	bwrapArgs, err := buildBwrapArgs(p, workspace, payloadBindPath, bridgeDir)
 	if err != nil {
 		if bridge != nil {
 			bridge.Close()
@@ -431,4 +485,484 @@ func loopbackSocketName(port int) string {
 
 func isClosedNetworkError(err error) bool {
 	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
+}
+
+type bwrapDenyShadow struct {
+	Source string
+	Dest   string
+}
+
+// BuildResolvedBwrap translates a resolved access policy into the bwrap
+// argument list that follows the leading "bwrap" name and precedes the
+// trailing "--" + payload separator. It is default-deny: only runtime/system
+// reads, explicit read grants, write grants, provider state and scratch are
+// mounted into the child namespace. SourceRead entries are intentionally not
+// mounted because they are preparation inputs, not execution grants.
+func BuildResolvedBwrap(p ResolvedAccessPolicy) ([]string, error) {
+	return buildResolvedBwrapArgs(p, "", "", nil)
+}
+
+// BuildResolvedBwrapArgs is kept as a compatibility alias for callers that
+// adopted the M10 name while the API was settling.
+func BuildResolvedBwrapArgs(p ResolvedAccessPolicy) ([]string, error) {
+	return BuildResolvedBwrap(p)
+}
+
+func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string, denyShadows []bwrapDenyShadow) ([]string, error) {
+	if p.Mode == ConfinementDisabled {
+		return nil, fmt.Errorf("%w: disabled policy %q has no bwrap arguments", ErrUnsupportedPolicy, p.ID)
+	}
+	if p.Subprocess == SubprocessDeny {
+		return nil, fmt.Errorf("%w: subprocess deny is unsupported by linux bwrap resolved enforcement", ErrUnsupportedPolicy)
+	}
+
+	args := make([]string, 0, 48)
+	seenMounts := map[string]bool{}
+	mounted := make([]string, 0, 16)
+	writableMounted := make([]string, 0, 8)
+	addMount := func(flag, source, dest string) {
+		key := dest
+		if seenMounts[key] {
+			return
+		}
+		seenMounts[key] = true
+		mounted = append(mounted, dest)
+		if flag == "--bind" {
+			writableMounted = append(writableMounted, dest)
+		}
+		args = append(args, flag, source, dest)
+	}
+	alreadyMounted := func(path string) bool {
+		for _, root := range mounted {
+			if pathWithinBind(path, root) {
+				return true
+			}
+		}
+		return false
+	}
+	alreadyWritable := func(path string) bool {
+		for _, root := range writableMounted {
+			if pathWithinBind(path, root) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, path := range bwrapResolvedSystemReadPaths() {
+		addMount("--ro-bind", path, path)
+	}
+
+	// Hide host /tmp, then recreate parent directories needed by explicit
+	// absolute mounts under the private tmpfs before binding the requested roots.
+	args = append(args, "--tmpfs", "/tmp")
+	for _, dir := range bwrapMountParentDirs(p, helperPath, bridgeDir, denyShadows) {
+		args = append(args, "--dir", dir)
+	}
+
+	for _, item := range p.allWrites() {
+		if err := ensureExistingBwrapSource(item.Path, true); err != nil {
+			return nil, err
+		}
+		if !alreadyWritable(item.Path) {
+			addMount("--bind", item.Path, item.Path)
+		}
+	}
+	for _, item := range p.allReads() {
+		if alreadyMounted(item.Path) {
+			continue
+		}
+		if err := ensureExistingBwrapSource(item.Path, false); err != nil {
+			return nil, err
+		}
+		addMount("--ro-bind", item.Path, item.Path)
+	}
+
+	if helperPath != "" && !resolvedPathVisibleInSandbox(helperPath, p) {
+		addMount("--ro-bind", helperPath, helperPath)
+	}
+	if bridgeDir != "" && !resolvedPathVisibleInSandbox(bridgeDir, p) {
+		addMount("--ro-bind", bridgeDir, bridgeDir)
+	}
+
+	// Deny precedence is implemented after broader read/write parents are mounted.
+	// ApplyResolved passes unreadable shadow sources, which supports both file and
+	// directory denies. The pure BuildResolvedBwrap path has no temp shadow source,
+	// so it emits directory overlays directly and rejects file-level deny rules.
+	if len(denyShadows) > 0 {
+		for _, shadow := range denyShadows {
+			args = append(args, "--ro-bind", shadow.Source, shadow.Dest)
+		}
+	} else {
+		deniedDirs, err := pureResolvedBwrapDenyDirs(p)
+		if err != nil {
+			return nil, err
+		}
+		for _, denied := range deniedDirs {
+			args = append(args, "--perms", "000", "--dir", denied)
+		}
+	}
+
+	args = append(args,
+		"--dev", "/dev",
+		"--proc", "/proc",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
+		"--unshare-cgroup-try",
+		"--unshare-user-try",
+		"--new-session",
+		"--die-with-parent",
+	)
+
+	switch p.Network.Mode {
+	case NetworkFull:
+		// Keep host network namespace by explicit policy request.
+	case NetworkDeny, NetworkLoopback:
+		args = append(args, "--unshare-net")
+	default:
+		return nil, fmt.Errorf("%w: unsupported network mode %q", ErrUnsupportedPolicy, p.Network.Mode)
+	}
+
+	if p.Roots.CWD != "" {
+		if !alreadyMounted(p.Roots.CWD) {
+			args = append(args, "--dir", p.Roots.CWD)
+		}
+		args = append(args, "--chdir", p.Roots.CWD)
+	}
+
+	return args, nil
+}
+
+func pureResolvedBwrapDenyDirs(p ResolvedAccessPolicy) ([]string, error) {
+	denies := p.allDenies()
+	if len(denies) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(denies))
+	seen := map[string]bool{}
+	for _, item := range denies {
+		if seen[item.Path] {
+			continue
+		}
+		info, err := os.Lstat(item.Path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("inspect denied bwrap path %q: %w", item.Path, err)
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("%w: linux bwrap pure argument generation supports directory deny overlays only, got %q", ErrUnsupportedPolicy, item.Path)
+		}
+		seen[item.Path] = true
+		out = append(out, item.Path)
+	}
+	slices.SortFunc(out, func(a, b string) int {
+		if depthA, depthB := pathDepthLinux(a), pathDepthLinux(b); depthA != depthB {
+			return depthA - depthB
+		}
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	})
+	return out, nil
+}
+
+func pathDepthLinux(path string) int {
+	path = filepath.Clean(path)
+	if path == string(filepath.Separator) {
+		return 0
+	}
+	return strings.Count(path, string(filepath.Separator))
+}
+
+func bwrapResolvedSystemReadPaths() []string {
+	return existingLinuxPaths(bwrapRoBindCandidates)
+}
+
+func existingLinuxPaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err == nil {
+			// Preserve Linux compatibility symlink mountpoints such as /bin and /lib.
+			// Executables and ELF interpreters may still refer to those paths even
+			// when the directories resolve under /usr on merged-/usr distros.
+			out = append(out, filepath.Clean(path))
+		}
+	}
+	return out
+}
+
+func ensureExistingBwrapSource(path string, writable bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if writable {
+				return fmt.Errorf("sandbox: writable bwrap source %q does not exist", path)
+			}
+			return fmt.Errorf("sandbox: readable bwrap source %q does not exist", path)
+		}
+		return fmt.Errorf("sandbox: inspect bwrap source %q: %w", path, err)
+	}
+	if writable && !info.IsDir() {
+		return fmt.Errorf("sandbox: writable bwrap source %q is not a directory", path)
+	}
+	return nil
+}
+
+func bwrapMountParentDirs(p ResolvedAccessPolicy, helperPath, bridgeDir string, denyShadows []bwrapDenyShadow) []string {
+	seen := map[string]bool{"/": true}
+	var dirs []string
+	addForPath := func(path string) {
+		for _, dir := range parentDirsForBwrap(path) {
+			if seen[dir] {
+				continue
+			}
+			seen[dir] = true
+			dirs = append(dirs, dir)
+		}
+	}
+	for _, item := range p.allReads() {
+		addForPath(item.Path)
+	}
+	for _, item := range p.allWrites() {
+		addForPath(item.Path)
+	}
+	for _, item := range p.allDenies() {
+		addForPath(item.Path)
+	}
+	if helperPath != "" {
+		addForPath(helperPath)
+	}
+	if bridgeDir != "" {
+		addForPath(bridgeDir)
+	}
+	for _, shadow := range denyShadows {
+		addForPath(shadow.Dest)
+	}
+	slices.Sort(dirs)
+	return dirs
+}
+
+func parentDirsForBwrap(path string) []string {
+	path = filepath.Clean(path)
+	parent := filepath.Dir(path)
+	if parent == "." || parent == "/" {
+		return nil
+	}
+	var rev []string
+	for parent != "/" && parent != "." {
+		rev = append(rev, parent)
+		parent = filepath.Dir(parent)
+	}
+	out := make([]string, 0, len(rev))
+	for i := len(rev) - 1; i >= 0; i-- {
+		out = append(out, rev[i])
+	}
+	return out
+}
+
+func resolvedPathVisibleInSandbox(target string, p ResolvedAccessPolicy) bool {
+	for _, item := range append(p.allReads(), p.allWrites()...) {
+		if pathWithinBind(target, item.Path) {
+			return true
+		}
+	}
+	for _, candidate := range bwrapResolvedSystemReadPaths() {
+		if pathWithinBind(target, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func prepareBwrapDenyShadows(p ResolvedAccessPolicy) ([]bwrapDenyShadow, func(), error) {
+	denies := p.allDenies()
+	if len(denies) == 0 {
+		return nil, func() {}, nil
+	}
+	dir, err := os.MkdirTemp("", "go-sandbox-deny-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create deny shadow dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	shadows := make([]bwrapDenyShadow, 0, len(denies))
+	for i, item := range denies {
+		info, err := os.Lstat(item.Path)
+		if err != nil {
+			cleanup()
+			if os.IsNotExist(err) {
+				return nil, nil, fmt.Errorf("sandbox: denied bwrap path %q does not exist; refusing to create host path for shadow deny", item.Path)
+			}
+			return nil, nil, fmt.Errorf("sandbox: inspect denied bwrap path %q: %w", item.Path, err)
+		}
+		shadow := filepath.Join(dir, fmt.Sprintf("deny-%d", i))
+		if info.IsDir() {
+			if err := os.Mkdir(shadow, 0o000); err != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("create deny shadow dir: %w", err)
+			}
+		} else {
+			f, err := os.OpenFile(shadow, os.O_CREATE|os.O_EXCL, 0o000)
+			if err != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("create deny shadow file: %w", err)
+			}
+			if err := f.Close(); err != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("close deny shadow file: %w", err)
+			}
+		}
+		shadows = append(shadows, bwrapDenyShadow{Source: shadow, Dest: item.Path})
+	}
+	return shadows, cleanup, nil
+}
+
+func probeResolvedBwrapBackend(bwrapBin string, networkMode NetworkMode) error {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		return fmt.Errorf("%w: resolve true for bwrap capability probe: %v", ErrBackendUnavailable, err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(truePath); resolveErr == nil {
+		truePath = resolved
+	}
+
+	args := make([]string, 0, 32)
+	for _, path := range bwrapResolvedSystemReadPaths() {
+		args = append(args, "--ro-bind", path, path)
+	}
+	if !pathVisibleInResolvedBwrapProbe(truePath) {
+		args = append(args, "--ro-bind", truePath, truePath)
+	}
+	args = append(args,
+		"--dev", "/dev",
+		"--proc", "/proc",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
+		"--unshare-cgroup-try",
+		"--unshare-user-try",
+		"--new-session",
+		"--die-with-parent",
+	)
+	if networkMode == NetworkDeny || networkMode == NetworkLoopback {
+		args = append(args, "--unshare-net")
+	}
+	args = append(args, "--", truePath)
+
+	cmd := exec.Command(bwrapBin, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("%w: bwrap namespace probe failed: %s", ErrBackendUnavailable, detail)
+	}
+	return nil
+}
+
+func pathVisibleInResolvedBwrapProbe(target string) bool {
+	for _, candidate := range bwrapResolvedSystemReadPaths() {
+		if pathWithinBind(target, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyResolved(cmd *exec.Cmd, p ResolvedAccessPolicy) (func(), error) {
+	bwrapBin, err := exec.LookPath("bwrap")
+	if err != nil {
+		return nil, fmt.Errorf("%w: bwrap not found: cannot enforce policy %q on this system (install bubblewrap)", ErrBackendUnavailable, p.ID)
+	}
+	if err := probeResolvedBwrapBackend(bwrapBin, p.Network.Mode); err != nil {
+		return nil, err
+	}
+
+	origPath := cmd.Path
+	origArgs := cmd.Args[1:]
+	payloadPath := origPath
+	payloadArgs := origArgs
+	useLoopbackHelper := p.Network.Mode == NetworkLoopback
+	var bridge *loopbackForwarders
+
+	helperPath := ""
+	if useLoopbackHelper {
+		resolvedOrigPath := origPath
+		if !filepath.IsAbs(resolvedOrigPath) {
+			resolvedOrigPath, err = exec.LookPath(origPath)
+			if err != nil {
+				return nil, fmt.Errorf("resolve sandbox target %q: %w", origPath, err)
+			}
+		}
+		if len(p.Network.LoopbackPorts) > 0 {
+			bridge, err = startLoopbackForwarders(p.Network.LoopbackPorts)
+			if err != nil {
+				return nil, err
+			}
+		}
+		helperPath, err = os.Executable()
+		if err != nil {
+			if bridge != nil {
+				bridge.Close()
+			}
+			return nil, fmt.Errorf("resolve loopback helper executable: %w", err)
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(helperPath); resolveErr == nil {
+			helperPath = resolved
+		}
+		payloadPath = helperPath
+		payloadArgs = append([]string{loopbackHelperArg, resolvedOrigPath}, origArgs...)
+		cmd.Env = append(inheritedEnv(cmd.Env), loopbackHelperEnv+"=1")
+		if bridge != nil {
+			cmd.Env = append(cmd.Env,
+				loopbackHelperForwardDirEnv+"="+bridge.dir,
+				loopbackHelperForwardPortsEnv+"="+encodeLoopbackPorts(bridge.ports),
+			)
+		}
+	}
+
+	shadows, cleanupShadows, err := prepareBwrapDenyShadows(p)
+	if err != nil {
+		if bridge != nil {
+			bridge.Close()
+		}
+		return nil, err
+	}
+
+	bridgeDir := ""
+	if bridge != nil {
+		bridgeDir = bridge.dir
+	}
+	bwrapArgs, err := buildResolvedBwrapArgs(p, helperPath, bridgeDir, shadows)
+	if err != nil {
+		cleanupShadows()
+		if bridge != nil {
+			bridge.Close()
+		}
+		return nil, err
+	}
+
+	full := make([]string, 0, 1+len(bwrapArgs)+2+len(payloadArgs))
+	full = append(full, "bwrap")
+	full = append(full, bwrapArgs...)
+	full = append(full, "--", payloadPath)
+	full = append(full, payloadArgs...)
+
+	cmd.Path = bwrapBin
+	cmd.Args = full
+	cmd.Dir = ""
+
+	return func() {
+		cleanupShadows()
+		if bridge != nil {
+			bridge.Close()
+		}
+	}, nil
 }

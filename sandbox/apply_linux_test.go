@@ -3,7 +3,10 @@
 package sandbox
 
 import (
+	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -216,4 +219,192 @@ func TestValidateLoopbackPorts(t *testing.T) {
 	if _, err := validateLoopbackPorts([]int{4317, 4317}); err == nil {
 		t.Fatal("expected duplicate port error")
 	}
+}
+
+func TestBuildResolvedBwrap_DefaultDenyBindingsAndDenyOverlay(t *testing.T) {
+	base := t.TempDir()
+	project := filepath.Join(base, "project root")
+	boot := filepath.Join(base, "boot root")
+	state := filepath.Join(base, "provider state")
+	scratch := filepath.Join(base, "scratch root")
+	cwd := filepath.Join(project, "subdir")
+	source := filepath.Join(base, "source only")
+	for _, path := range []string{
+		filepath.Join(project, "secrets"),
+		boot,
+		state,
+		scratch,
+		cwd,
+		source,
+	} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+	}
+
+	resolved, err := ResolveAccessPolicy(AccessPolicy{
+		ID:    "resolved-linux",
+		Mode:  ConfinementRequired,
+		Roots: Roots{Project: project, Boot: boot, State: state, Scratch: scratch, CWD: cwd},
+		FS: FilesystemAccess{
+			Read:       []PathRef{{Root: BootRoot}},
+			Write:      []PathRef{{Root: ProjectRoot}},
+			Deny:       []PathRef{{Root: ProjectRoot, Relative: "secrets"}},
+			SourceRead: []PathRef{{Path: source}},
+		},
+		Runtime:       RuntimeAccess{Executable: PathRef{Path: "/bin/sh"}},
+		ProviderState: ProviderStateAccess{Write: []PathRef{{Root: StateRoot}}},
+		Scratch:       ScratchAccess{Writable: true},
+		Network:       NetworkAccess{Mode: NetworkDeny},
+		Subprocess:    SubprocessAllow,
+	})
+	if err != nil {
+		t.Fatalf("ResolveAccessPolicy: %v", err)
+	}
+
+	args, err := BuildResolvedBwrap(resolved)
+	if err != nil {
+		t.Fatalf("BuildResolvedBwrap: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--ro-bind / /") {
+		t.Fatalf("resolved bwrap emitted blanket root bind:\n%s", joined)
+	}
+	for _, seq := range [][]string{
+		{"--tmpfs", "/tmp"},
+		{"--bind", resolved.Roots.Project, resolved.Roots.Project},
+		{"--ro-bind", resolved.Roots.Boot, resolved.Roots.Boot},
+		{"--bind", resolved.Roots.State, resolved.Roots.State},
+		{"--bind", resolved.Roots.Scratch, resolved.Roots.Scratch},
+		{"--perms", "000", "--dir", filepath.Join(resolved.Roots.Project, "secrets")},
+		{"--unshare-net"},
+		{"--chdir", resolved.Roots.CWD},
+	} {
+		if !containsArgSequence(args, seq) {
+			t.Fatalf("resolved bwrap args missing %v\nargs: %v", seq, args)
+		}
+	}
+	if strings.Contains(joined, source) {
+		t.Fatalf("source-read path leaked into child bwrap grants:\n%s", joined)
+	}
+}
+
+func TestBuildResolvedBwrap_NetworkModes(t *testing.T) {
+	project := t.TempDir()
+	for _, tc := range []struct {
+		name      string
+		mode      NetworkMode
+		wantNetNS bool
+		loopback  []int
+	}{
+		{name: "deny", mode: NetworkDeny, wantNetNS: true},
+		{name: "loopback", mode: NetworkLoopback, wantNetNS: true, loopback: []int{4317}},
+		{name: "full", mode: NetworkFull, wantNetNS: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved, err := ResolveAccessPolicy(AccessPolicy{
+				ID:      "net-" + tc.name,
+				Mode:    ConfinementRequired,
+				Roots:   Roots{Project: project},
+				Network: NetworkAccess{Mode: tc.mode, LoopbackPorts: tc.loopback},
+			})
+			if err != nil {
+				t.Fatalf("ResolveAccessPolicy: %v", err)
+			}
+			args, err := BuildResolvedBwrap(resolved)
+			if err != nil {
+				t.Fatalf("BuildResolvedBwrap: %v", err)
+			}
+			gotNetNS := containsArgSequence(args, []string{"--unshare-net"})
+			if gotNetNS != tc.wantNetNS {
+				t.Fatalf("--unshare-net presence = %v, want %v\nargs: %v", gotNetNS, tc.wantNetNS, args)
+			}
+		})
+	}
+}
+
+func TestBuildResolvedBwrap_UnsupportedPolicyShapes(t *testing.T) {
+	project := t.TempDir()
+	fileDeny := filepath.Join(project, "token.txt")
+	if err := os.WriteFile(fileDeny, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("write denied file: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		build func() AccessPolicy
+	}{
+		{
+			name: "subprocess deny",
+			build: func() AccessPolicy {
+				return AccessPolicy{ID: "subprocess", Mode: ConfinementRequired, Roots: Roots{Project: project}, Network: NetworkAccess{Mode: NetworkDeny}, Subprocess: SubprocessDeny}
+			},
+		},
+		{
+			name: "file deny",
+			build: func() AccessPolicy {
+				return AccessPolicy{
+					ID:    "file-deny",
+					Mode:  ConfinementRequired,
+					Roots: Roots{Project: project},
+					FS: FilesystemAccess{
+						Write: []PathRef{{Root: ProjectRoot}},
+						Deny:  []PathRef{{Path: fileDeny}},
+					},
+					Network:    NetworkAccess{Mode: NetworkDeny},
+					Subprocess: SubprocessAllow,
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved, err := ResolveAccessPolicy(tc.build())
+			if err != nil {
+				t.Fatalf("ResolveAccessPolicy: %v", err)
+			}
+			_, err = BuildResolvedBwrap(resolved)
+			if !errors.Is(err, ErrUnsupportedPolicy) {
+				t.Fatalf("BuildResolvedBwrap err = %v, want ErrUnsupportedPolicy", err)
+			}
+		})
+	}
+}
+
+func TestApplyResolved_BwrapMissingReportsUnsupported(t *testing.T) {
+	project := t.TempDir()
+	resolved, err := ResolveAccessPolicy(AccessPolicy{
+		ID:         "missing-bwrap",
+		Mode:       ConfinementRequired,
+		Roots:      Roots{Project: project},
+		Network:    NetworkAccess{Mode: NetworkDeny},
+		Subprocess: SubprocessAllow,
+	})
+	if err != nil {
+		t.Fatalf("ResolveAccessPolicy: %v", err)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	cmd := exec.Command("/bin/true")
+	outcome, cleanup, err := ApplyResolved(cmd, resolved)
+	if !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("ApplyResolved err = %v, want ErrBackendUnavailable", err)
+	}
+	if cleanup != nil {
+		t.Fatalf("ApplyResolved returned cleanup on unavailable backend")
+	}
+	if outcome.State != EnforcementUnsupported || outcome.Backend != BackendLinuxBwrap || outcome.Enforced {
+		t.Fatalf("ApplyResolved outcome = %#v, want linux unsupported", outcome)
+	}
+}
+
+func containsArgSequence(args, seq []string) bool {
+	if len(seq) == 0 {
+		return true
+	}
+	for i := 0; i+len(seq) <= len(args); i++ {
+		if slices.Equal(args[i:i+len(seq)], seq) {
+			return true
+		}
+	}
+	return false
 }

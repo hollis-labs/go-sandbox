@@ -3,6 +3,8 @@
 package sandbox
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -176,6 +178,81 @@ func TestBuildSBPL_DenyPaths(t *testing.T) {
 	}
 	if !strings.Contains(sbpl, "(deny file-read* (subpath ") {
 		t.Errorf("expected file-read deny in SBPL:\n%s", sbpl)
+	}
+}
+
+func TestBuildResolvedSBPL_DefaultDenyAllowlist(t *testing.T) {
+	base := t.TempDir()
+	project := filepath.Join(base, "project root")
+	boot := filepath.Join(base, "boot root")
+	state := filepath.Join(base, "state root")
+	scratch := filepath.Join(base, "scratch root")
+	for _, path := range []string{
+		filepath.Join(project, "secrets"),
+		boot,
+		state,
+		scratch,
+	} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+	}
+
+	resolved, err := ResolveAccessPolicy(AccessPolicy{
+		ID:    "resolved",
+		Mode:  ConfinementRequired,
+		Roots: Roots{Project: project, Boot: boot, State: state, Scratch: scratch},
+		FS: FilesystemAccess{
+			Read:  []PathRef{{Root: BootRoot}},
+			Write: []PathRef{{Root: ProjectRoot}},
+			Deny:  []PathRef{{Root: ProjectRoot, Relative: "secrets"}},
+		},
+		Runtime:       RuntimeAccess{Executable: PathRef{Path: "/bin/sh"}},
+		ProviderState: ProviderStateAccess{Write: []PathRef{{Root: StateRoot}}},
+		Scratch:       ScratchAccess{Writable: true},
+		Network:       NetworkAccess{Mode: NetworkLoopback},
+		Subprocess:    SubprocessAllow,
+	})
+	if err != nil {
+		t.Fatalf("ResolveAccessPolicy: %v", err)
+	}
+
+	sbpl, err := BuildResolvedSBPL(resolved)
+	if err != nil {
+		t.Fatalf("BuildResolvedSBPL: %v", err)
+	}
+	if !strings.Contains(sbpl, "(deny default)") {
+		t.Fatalf("resolved SBPL missing default deny:\n%s", sbpl)
+	}
+	if strings.Contains(sbpl, "(allow default)") {
+		t.Fatalf("resolved SBPL contains legacy allow default:\n%s", sbpl)
+	}
+	if !strings.Contains(sbpl, `(allow file-read* (subpath "`+resolved.Roots.Boot+`"))`) {
+		t.Fatalf("resolved SBPL missing boot read allow:\n%s", sbpl)
+	}
+	if !strings.Contains(sbpl, `(allow file-write* (subpath "`+resolved.Roots.Project+`"))`) {
+		t.Fatalf("resolved SBPL missing project write allow:\n%s", sbpl)
+	}
+	if !strings.Contains(sbpl, `(deny file-read* (subpath "`+filepath.Join(resolved.Roots.Project, "secrets")+`"))`) {
+		t.Fatalf("resolved SBPL missing denied descendant:\n%s", sbpl)
+	}
+	if !strings.Contains(sbpl, "(deny network*)") {
+		t.Fatalf("resolved SBPL missing network deny:\n%s", sbpl)
+	}
+}
+
+func TestBuildResolvedSBPL_RejectsUnsafeResolvedPath(t *testing.T) {
+	_, err := BuildResolvedSBPL(ResolvedAccessPolicy{
+		ID:   "unsafe",
+		Mode: ConfinementRequired,
+		FS: ResolvedFilesystemAccess{
+			Read: []ResolvedPath{{Kind: AccessRead, Path: `/tmp/evil") (allow default)`}},
+		},
+		Network:    NetworkAccess{Mode: NetworkDeny},
+		Subprocess: SubprocessAllow,
+	})
+	if err == nil {
+		t.Fatal("BuildResolvedSBPL accepted unsafe resolved path")
 	}
 }
 

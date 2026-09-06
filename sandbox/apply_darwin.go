@@ -148,6 +148,206 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 	return b.String(), nil
 }
 
+// BuildResolvedSBPL generates a macOS sandbox-exec seatbelt profile for an
+// already-resolved access policy. Unlike BuildSBPL's legacy compatibility
+// posture, this emitter uses default-deny plus Apple's system.sb import for
+// baseline OS services, then grants only resolved filesystem/runtime paths.
+// Explicit denies still take precedence beneath allowed parents.
+func BuildResolvedSBPL(p ResolvedAccessPolicy) (string, error) {
+	if p.Mode == ConfinementDisabled {
+		return "", fmt.Errorf("sandbox: disabled policy %q has no SBPL profile", p.ID)
+	}
+	if p.Subprocess == SubprocessDeny {
+		return "", fmt.Errorf("sandbox: subprocess deny is unsupported by resolved darwin pre-spawn enforcement")
+	}
+
+	var b strings.Builder
+	b.WriteString("(version 1)\n\n")
+	b.WriteString("; Resolved access policy: default deny with system service support and explicit grants.\n")
+	b.WriteString("(deny default)\n")
+	b.WriteString("(import \"system.sb\")\n\n")
+	b.WriteString("; Process control for the initial sandboxed payload.\n")
+	b.WriteString("(allow process*)\n\n")
+	b.WriteString("; Metadata reads let the runtime traverse parent directories without exposing file contents.\n")
+	b.WriteString("(allow file-read-metadata)\n\n")
+
+	readable := append(darwinSystemReadPaths(), resolvedPathStrings(p.allReads())...)
+	readable = append(readable, resolvedPathStrings(p.allWrites())...)
+	writable := resolvedPathStrings(p.allWrites())
+	if err := writeResolvedReadAllows(&b, readable); err != nil {
+		return "", err
+	}
+	if err := writeResolvedWriteAllows(&b, writable); err != nil {
+		return "", err
+	}
+	if err := writeResolvedDenies(&b, resolvedPathStrings(p.allDenies())); err != nil {
+		return "", err
+	}
+
+	switch p.Network.Mode {
+	case NetworkFull:
+		b.WriteString("; Full network was explicitly requested.\n")
+		b.WriteString("(allow network*)\n\n")
+	case NetworkLoopback:
+		if err := writeLoopbackAllows(&b); err != nil {
+			return "", err
+		}
+		b.WriteString("; Block all network traffic beyond the loopback allowlist above.\n")
+		b.WriteString("(deny network*)\n\n")
+	default:
+		b.WriteString("; Network denied by policy and default-deny posture.\n\n")
+	}
+
+	return b.String(), nil
+}
+
+func darwinSystemReadPaths() []string {
+	paths := []string{
+		"/bin",
+		"/sbin",
+		"/usr/bin",
+		"/usr/lib",
+		"/usr/share",
+		"/System/Library",
+		"/Library/Apple",
+		"/private/var/db/timezone",
+		"/etc/localtime",
+		"/dev/null",
+	}
+	return existingDarwinPaths(paths)
+}
+
+func existingDarwinPaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err == nil {
+			if resolved, err := filepath.EvalSymlinks(path); err == nil {
+				path = resolved
+			}
+			out = append(out, filepath.Clean(path))
+		}
+	}
+	return out
+}
+
+func resolvedPathStrings(paths []ResolvedPath) []string {
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		out = append(out, path.Path)
+	}
+	return out
+}
+
+func writeResolvedReadAllows(b *strings.Builder, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	b.WriteString("; Read-only filesystem grants.\n")
+	for _, path := range paths {
+		if err := writeSeatbeltPathRule(b, "allow", "file-read*", path); err != nil {
+			return err
+		}
+		if err := writeSeatbeltPathRule(b, "allow", "file-map-executable", path); err != nil {
+			return err
+		}
+	}
+	b.WriteString("\n")
+	return nil
+}
+
+func writeResolvedWriteAllows(b *strings.Builder, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	b.WriteString("; Writable filesystem grants.\n")
+	for _, path := range paths {
+		if err := writeSeatbeltPathRule(b, "allow", "file-read*", path); err != nil {
+			return err
+		}
+		if err := writeSeatbeltPathRule(b, "allow", "file-write*", path); err != nil {
+			return err
+		}
+		if err := writeSeatbeltPathRule(b, "allow", "file-map-executable", path); err != nil {
+			return err
+		}
+	}
+	b.WriteString("\n")
+	return nil
+}
+
+func writeResolvedDenies(b *strings.Builder, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	b.WriteString("; Explicit deny grants override enclosing allows.\n")
+	for _, path := range paths {
+		if err := writeSeatbeltPathRule(b, "deny", "file-read*", path); err != nil {
+			return err
+		}
+		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
+			return err
+		}
+	}
+	b.WriteString("\n")
+	return nil
+}
+
+func writeSeatbeltPathRule(b *strings.Builder, action, operation, path string) error {
+	aliases, err := seatbeltAliases([]string{path})
+	if err != nil {
+		return err
+	}
+	for _, candidate := range aliases {
+		fmt.Fprintf(b, "(%s %s (literal \"%s\"))\n", action, operation, candidate)
+		fmt.Fprintf(b, "(%s %s (subpath \"%s\"))\n", action, operation, candidate)
+	}
+	return nil
+}
+
+func seatbeltAliases(paths []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, path := range paths {
+		for _, candidate := range seatbeltPathAliases(path) {
+			if err := validateSeatbeltLiteral("path", candidate); err != nil {
+				return nil, err
+			}
+			if !seen[candidate] {
+				seen[candidate] = true
+				out = append(out, candidate)
+			}
+		}
+	}
+	return out, nil
+}
+
+func seatbeltPathAliases(path string) []string {
+	path = filepath.Clean(path)
+	seen := map[string]bool{}
+	var out []string
+	add := func(candidate string) {
+		candidate = filepath.Clean(candidate)
+		if !seen[candidate] {
+			seen[candidate] = true
+			out = append(out, candidate)
+		}
+	}
+	add(path)
+	const privateTmp = "/private/tmp"
+	if path == privateTmp {
+		add("/tmp")
+	} else if strings.HasPrefix(path, privateTmp+"/") {
+		add("/tmp/" + strings.TrimPrefix(path, privateTmp+"/"))
+	}
+	const privateVar = "/private/var"
+	if path == privateVar {
+		add("/var")
+	} else if strings.HasPrefix(path, privateVar+"/") {
+		add("/var/" + strings.TrimPrefix(path, privateVar+"/"))
+	}
+	return out
+}
+
 func writeLoopbackAllows(b *strings.Builder) error {
 	for _, literal := range []struct {
 		field string
@@ -216,6 +416,43 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 	}
 
 	sbpl, err := BuildSBPL(p, workspace)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.CreateTemp("", "go-sandbox-*.sb")
+	if err != nil {
+		return nil, fmt.Errorf("create sandbox profile temp file: %w", err)
+	}
+	profilePath := f.Name()
+	if _, err := f.WriteString(sbpl); err != nil {
+		_ = f.Close()
+		_ = os.Remove(profilePath)
+		return nil, fmt.Errorf("write sandbox profile: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(profilePath)
+		return nil, fmt.Errorf("close sandbox profile: %w", err)
+	}
+
+	origPath := cmd.Path
+	origArgs := cmd.Args[1:]
+	cmd.Path = sbplBin
+	newArgs := make([]string, 0, 4+len(origArgs))
+	newArgs = append(newArgs, "sandbox-exec", "-f", profilePath, origPath)
+	newArgs = append(newArgs, origArgs...)
+	cmd.Args = newArgs
+
+	return func() { _ = os.Remove(profilePath) }, nil
+}
+
+func applyResolved(cmd *exec.Cmd, p ResolvedAccessPolicy) (func(), error) {
+	sbplBin, err := exec.LookPath("sandbox-exec")
+	if err != nil {
+		return nil, fmt.Errorf("sandbox-exec not found: cannot enforce policy %q on this system", p.ID)
+	}
+
+	sbpl, err := BuildResolvedSBPL(p)
 	if err != nil {
 		return nil, err
 	}

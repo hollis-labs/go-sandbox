@@ -1,16 +1,23 @@
-// Package sandbox applies per-process OS-level sandboxes (macOS sandbox-exec
-// / Linux bubblewrap) on top of an already-built *exec.Cmd, driven by a
-// declarative Profile.
+// Package sandbox defines and applies per-process OS-level sandboxes (macOS
+// sandbox-exec / Linux bubblewrap) on top of an already-built *exec.Cmd.
 //
-// The Profile shape (FS read/write/deny + net + subprocess gates) is taken
-// from a sibling agent-broker project's sandbox package. The macOS and Linux
-// backends and their hardening posture (SBPL literal validator, narrowed
-// bwrap --ro-bind set, per-invocation tmpfs, namespace unsharing,
-// --die-with-parent, cleanup pattern) are taken from a sibling manifest-
-// runner project's hardened implementation. See README for the full
-// extraction lineage and audit-trace.
+// New callers should build an AccessPolicy, resolve it with
+// ResolveAccessPolicy, and wrap the launch with ApplyResolved. Callers that
+// need to preflight can check ResolveBackendCapabilities and AssessEnforcement
+// first; ApplyResolved performs the same check before changing the command and
+// returns the EnforcementOutcome that should be recorded at launch.
+// AccessPolicy names ProjectRoot, BootRoot, StateRoot, ScratchRoot and CWDRoot
+// independently so a boot directory or changed process cwd cannot silently
+// become the workspace boundary. SourceRead paths are preparation inputs only;
+// they are not child execution grants. Deny paths take precedence beneath
+// allowed parents. On Linux, resolved bwrap enforcement binds explicit grants
+// into a private namespace and reports unavailable bwrap/kernel prerequisites as
+// unsupported rather than silently downgrading.
 //
-// Posture: default-allow with selective denies. Tightening to default-deny
-// requires a well-tested per-OS allowlist and is intentionally left to a
-// future sprint. See README for in-scope / out-of-scope details.
+// Profile remains supported as the legacy compatibility shape for existing
+// Apply callers. PolicyFromProfile marks that conversion as Legacy.DefaultAllow
+// because the old shape is selective-deny rather than strict workspace
+// confinement. Callers must not report that legacy mode as required allowlist
+// confinement unless AssessEnforcement confirms the selected backend has the
+// requested capabilities.
 package sandbox
