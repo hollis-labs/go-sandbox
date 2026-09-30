@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Add `DenyGUILaunch` to `AccessPolicy`, `ResolvedAccessPolicy` and the legacy
+  `Profile` (`deny_gui_launch`), and the `CapGUILaunchDeny` capability. Both
+  macOS emitters (`BuildSBPL`, `BuildResolvedSBPL`) deny exec of
+  `/usr/bin/open` and Mach lookups of `com.apple.coreservices.launchservicesd`
+  and `com.apple.lsd.*`; the resolved emitter writes the denies last so they
+  follow the `system.sb` and `process*` allows. Linux bwrap does not provide
+  the capability, so a required resolved policy that sets it is reported
+  unsupported there. Tests launch real processes under `sandbox-exec`.
+
 ## v0.3.0 — 2026-09-06
 
 - Add resolved filesystem, network and subprocess access policies, backend

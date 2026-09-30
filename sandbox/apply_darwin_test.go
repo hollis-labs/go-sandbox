@@ -279,3 +279,53 @@ func truncate(s string, n int) string {
 	}
 	return s[:n]
 }
+
+func TestBuildSBPL_DenyGUILaunch(t *testing.T) {
+	on, err := BuildSBPL(Profile{ID: "gui", Net: true, Subprocess: true, DenyGUILaunch: true}, "/tmp/ws/xyz")
+	if err != nil {
+		t.Fatalf("BuildSBPL: %v", err)
+	}
+	for _, want := range []string{
+		`(deny process-exec (literal "/usr/bin/open"))`,
+		`(global-name "com.apple.coreservices.launchservicesd")`,
+		`(global-name-regex #"^com\.apple\.lsd\.")`,
+	} {
+		if !strings.Contains(on, want) {
+			t.Errorf("DenyGUILaunch: missing %q in:\n%s", want, on)
+		}
+	}
+	off, err := BuildSBPL(Profile{ID: "gui", Net: true, Subprocess: true}, "/tmp/ws/xyz")
+	if err != nil {
+		t.Fatalf("BuildSBPL: %v", err)
+	}
+	if strings.Contains(off, "/usr/bin/open") || strings.Contains(off, "launchservicesd") {
+		t.Errorf("GUI denies emitted without DenyGUILaunch:\n%s", off)
+	}
+}
+
+func TestBuildResolvedSBPL_DenyGUILaunchComesAfterAllows(t *testing.T) {
+	dir := t.TempDir()
+	resolved, err := ResolveAccessPolicy(AccessPolicy{
+		ID:            "gui-only",
+		Mode:          ConfinementRequired,
+		Roots:         Roots{Project: dir, CWD: dir},
+		DenyGUILaunch: true,
+	})
+	if err != nil {
+		t.Fatalf("ResolveAccessPolicy: %v", err)
+	}
+	sbpl, err := BuildResolvedSBPL(resolved)
+	if err != nil {
+		t.Fatalf("BuildResolvedSBPL: %v", err)
+	}
+	deny := strings.Index(sbpl, `(deny process-exec (literal "/usr/bin/open"))`)
+	if deny < 0 {
+		t.Fatalf("missing exec deny in:\n%s", sbpl)
+	}
+	if allow := strings.LastIndex(sbpl, "(allow process*)"); allow < 0 || deny < allow {
+		t.Errorf("GUI denies must follow the allows (allow at %d, deny at %d)", allow, deny)
+	}
+	if !strings.Contains(sbpl, "launchservicesd") {
+		t.Errorf("missing LaunchServices mach-lookup deny in:\n%s", sbpl)
+	}
+}

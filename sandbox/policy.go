@@ -140,6 +140,10 @@ type AccessPolicy struct {
 	Scratch       ScratchAccess
 	Network       NetworkAccess
 	Subprocess    SubprocessMode
+	// DenyGUILaunch requests that the child cannot launch GUI applications
+	// (open(1), LaunchServices). Backends that cannot enforce it report
+	// CapGUILaunchDeny as unsupported.
+	DenyGUILaunch bool
 	Legacy        LegacyCompatibility
 }
 
@@ -193,6 +197,7 @@ type ResolvedAccessPolicy struct {
 	Scratch       []ResolvedPath
 	Network       NetworkAccess
 	Subprocess    SubprocessMode
+	DenyGUILaunch bool
 	Legacy        LegacyCompatibility
 }
 
@@ -260,6 +265,8 @@ func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
 		Network:    NetworkAccess{Mode: p.Network.Mode, LoopbackPorts: slices.Clone(p.Network.LoopbackPorts)},
 		Subprocess: p.Subprocess,
 		Legacy:     p.Legacy,
+
+		DenyGUILaunch: p.DenyGUILaunch,
 	}
 
 	if resolved.FS.Read, err = resolvePathRefs(AccessRead, p.FS.Read, roots); err != nil {
@@ -341,6 +348,7 @@ func (p ResolvedAccessPolicy) LegacyProfile() Profile {
 		AllowLoopback:        p.Network.Mode == NetworkLoopback,
 		LoopbackForwardPorts: slices.Clone(p.Network.LoopbackPorts),
 		Subprocess:           p.Subprocess != SubprocessDeny,
+		DenyGUILaunch:        p.DenyGUILaunch,
 	}
 	for _, item := range p.allReads() {
 		profile.FS.Read = append(profile.FS.Read, item.Path)
@@ -380,7 +388,8 @@ func PolicyFromProfile(p Profile, workspace string) AccessPolicy {
 			Mode:          legacyNetworkMode(p),
 			LoopbackPorts: slices.Clone(p.LoopbackForwardPorts),
 		},
-		Subprocess: legacySubprocessMode(p),
+		Subprocess:    legacySubprocessMode(p),
+		DenyGUILaunch: p.DenyGUILaunch,
 		Legacy: LegacyCompatibility{
 			Enabled:      true,
 			Source:       "Profile",
@@ -402,6 +411,7 @@ const (
 	CapLoopback            Capability = "loopback"
 	CapLoopbackForward     Capability = "loopback-forward"
 	CapSubprocessDeny      Capability = "subprocess-deny"
+	CapGUILaunchDeny       Capability = "gui-launch-deny"
 	CapDisabledMode        Capability = "disabled-mode"
 )
 
@@ -445,6 +455,7 @@ func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapab
 			CapScratch,
 			CapNetworkDeny,
 			CapLoopback,
+			CapGUILaunchDeny,
 		}
 	case BackendLinuxBwrap:
 		caps.Supported = goos == "linux"
@@ -820,6 +831,9 @@ func requiredCapabilities(p ResolvedAccessPolicy) []Capability {
 	}
 	if p.Subprocess == SubprocessDeny {
 		add(CapSubprocessDeny)
+	}
+	if p.DenyGUILaunch {
+		add(CapGUILaunchDeny)
 	}
 	return caps
 }
