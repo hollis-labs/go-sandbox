@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## v0.4.0 — 2026-09-30
 
 - Add `DenyGUILaunch` to `AccessPolicy`, `ResolvedAccessPolicy` and the legacy
   `Profile` (`deny_gui_launch`), and the `CapGUILaunchDeny` capability. Both
