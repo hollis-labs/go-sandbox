@@ -72,6 +72,8 @@ defer cleanup()
 
 Unsupported resolved capabilities fail explicitly rather than falling back to broad grants. `SubprocessDeny` remains unsupported for resolved bwrap because bubblewrap isolates namespaces but does not prevent a sandboxed process from forking within that namespace. Legacy `Profile` callers can continue using `Apply`.
 
+`DenyGUILaunch` (on `AccessPolicy`, `ResolvedAccessPolicy` and the legacy `Profile`) stops the child from launching GUI applications, such as a CLI whose sign-in fallback opens a browser. On macOS both emitters deny `exec` of `/usr/bin/open` and Mach lookups of LaunchServices (`launchservicesd`, `lsd.*`), so a copy of `open` or any other LaunchServices client is cut off too. It is reported as the `gui-launch-deny` capability: macOS seatbelt provides it, Linux bwrap does not, and a required resolved policy that asks for it on Linux is refused rather than run unenforced. It is macOS-only and a no-op for legacy `Apply` on Linux, like `Subprocess`. A policy that sets only `DenyGUILaunch` is a valid required policy, so a host can apply a minimal profile carrying just this knob.
+
 Existing callers can continue using `Profile` directly:
 
 ```go

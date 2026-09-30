@@ -145,6 +145,10 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 		b.WriteString("(deny process-exec*)\n\n")
 	}
 
+	if p.DenyGUILaunch {
+		writeGUILaunchDenies(&b)
+	}
+
 	return b.String(), nil
 }
 
@@ -198,7 +202,25 @@ func BuildResolvedSBPL(p ResolvedAccessPolicy) (string, error) {
 		b.WriteString("; Network denied by policy and default-deny posture.\n\n")
 	}
 
+	// Last, so the denies follow the system.sb and process* allows above.
+	if p.DenyGUILaunch {
+		writeGUILaunchDenies(&b)
+	}
+
 	return b.String(), nil
+}
+
+// writeGUILaunchDenies emits the two rules that stop a child from launching
+// GUI applications, for example a CLI whose sign-in fallback opens a browser:
+// exec of /usr/bin/open, and Mach lookups of LaunchServices (launchservicesd
+// and the lsd.* services), which also blocks a copy of open or any other
+// client of LaunchServices. Verified with sandbox-exec on macOS 15.7: exec of
+// /usr/bin/open fails with EPERM, and `lsappinfo list` returns nothing under
+// the lookup deny while returning the running apps without it.
+func writeGUILaunchDenies(b *strings.Builder) {
+	b.WriteString("; Deny GUI launch: no open(1), no LaunchServices.\n")
+	b.WriteString("(deny process-exec (literal \"/usr/bin/open\"))\n")
+	b.WriteString("(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name-regex #\"^com\\.apple\\.lsd\\.\"))\n\n")
 }
 
 func darwinSystemReadPaths() []string {

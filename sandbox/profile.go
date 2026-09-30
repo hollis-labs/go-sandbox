@@ -43,6 +43,12 @@ type Profile struct {
 	// process-fork / process-exec* denies; Linux bwrap does not directly
 	// gate subprocess spawning (use namespace isolation instead).
 	Subprocess bool `yaml:"subprocess"`
+	// DenyGUILaunch blocks launching GUI applications, for example a CLI that
+	// falls back to opening a browser for an interactive sign-in. macOS
+	// enforces it via SBPL (exec of /usr/bin/open and Mach lookups of
+	// LaunchServices); Linux bwrap does not enforce it, and a resolved policy
+	// that requires it is refused there (see CapGUILaunchDeny).
+	DenyGUILaunch bool `yaml:"deny_gui_launch"`
 }
 
 // LoadProfile reads and parses a single profile YAML file.
