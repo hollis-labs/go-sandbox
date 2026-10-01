@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/hollis-labs/go-sandbox/internal/pathsafe"
+	"github.com/hollis-labs/go-safefs/pathsafe"
 )
 
 // ConfinementMode declares whether OS confinement is mandatory or explicitly
@@ -681,12 +681,46 @@ func canonicalPath(path string) (string, error) {
 	return resolveSymlinksBestEffortPolicy(abs)
 }
 
+// maxPolicySymlinkFollow bounds how many dangling links
+// resolveSymlinksBestEffortPolicy follows by hand, so a chain of dangling
+// links cannot loop. It matches go-safefs/pathsafe.
+const maxPolicySymlinkFollow = 40
+
+// resolveSymlinksBestEffortPolicy resolves path's symlinks, rejoining any
+// suffix that does not exist yet onto its longest existing ancestor. A
+// dangling symlink is followed by hand and judged by where it points: a
+// caller that creates the returned path writes through the link, so
+// reporting the link's own path (what EvalSymlinks' not-exist would leave)
+// let a link inside a granted root stand for a target outside it. This is
+// the fix go-safefs/pathsafe carries for ResolveUnder.
 func resolveSymlinksBestEffortPolicy(path string) (string, error) {
-	path = filepath.Clean(path)
+	return resolveSymlinksPolicyDepth(filepath.Clean(path), 0)
+}
+
+func resolveSymlinksPolicyDepth(path string, depth int) (string, error) {
 	if evald, err := filepath.EvalSymlinks(path); err == nil {
 		return filepath.Clean(evald), nil
 	} else if !os.IsNotExist(err) {
 		return "", err
+	}
+
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if depth >= maxPolicySymlinkFollow {
+			return "", fmt.Errorf("too many symlinks resolving %q", path)
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			// A relative target is relative to the link's real directory.
+			realDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+			if err != nil {
+				return "", err
+			}
+			target = filepath.Join(realDir, target)
+		}
+		return resolveSymlinksPolicyDepth(filepath.Clean(target), depth+1)
 	}
 
 	dir := path

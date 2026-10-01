@@ -3,6 +3,33 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.4.1 — 2026-10-01
+
+Security fix (CW-20261001-0057).
+
+- **Security: a dangling symlink inside a root no longer escapes it.**
+  - Path refs under a root (`PathRef{Root, Relative}`) went through
+    `internal/pathsafe.ResolveUnder`. When the final component was a symlink
+    whose target did not exist yet, `filepath.EvalSymlinks` reported
+    not-exist and the resolver fell back to the link's own path, so
+    `project/link -> /outside/newfile` resolved to `project/link` and passed
+    the root check. A caller that used the resolved path to create or write
+    the file wrote through the link to `/outside/newfile`. nanite#352 proved
+    the same defect in Nanite's copy.
+  - `ResolveUnder` now comes from `github.com/hollis-labs/go-safefs/pathsafe`
+    v0.1.0, which follows a dangling link (relative targets against the
+    link's real directory, chains up to 40 hops, cycles refused) and judges
+    where it points. `internal/pathsafe` is deleted.
+  - `ResolvedAccessPolicy.AccessFor`, and root/absolute-path canonicalization
+    in `ResolveAccessPolicy`, had the same fallback in their own resolver: a
+    dangling link inside a writable root was reported `AccessReadWrite` even
+    when it pointed outside every grant or into a denied subtree. That
+    resolver now follows dangling links the same way.
+  - A dangling link whose target stays inside the root is still allowed and
+    now resolves to that target.
+- New dependency: `github.com/hollis-labs/go-safefs` v0.1.0 (standard library
+  only).
+
 ## v0.4.0 — 2026-09-30
 
 - Add `DenyGUILaunch` to `AccessPolicy`, `ResolvedAccessPolicy` and the legacy

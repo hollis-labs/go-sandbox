@@ -136,7 +136,7 @@ In:
 - Linux bwrap backend with narrowed `--ro-bind` candidate set, resolved-policy read/write/provider-state/scratch binds, source-read exclusion, deny shadowing, per-invocation `--tmpfs /tmp`, namespace unsharing (`--unshare-pid` / `--unshare-ipc` / `--unshare-uts` / `--unshare-cgroup-try` / `--unshare-user-try`), `--die-with-parent`, `--new-session`, conditional `--unshare-net`
 - `LoadProfile` / `LoadProfiles` YAML loaders
 - Cleanup-function return on darwin so callers can `defer cleanup()` without leaking temp profile files
-- Internal `pathsafe.ResolveUnder` helper for bounded path resolution (not exported)
+- Bounded path resolution through `github.com/hollis-labs/go-safefs/pathsafe` (`ResolveUnder`), which judges a dangling symlink by where it points
 - `examples/mux_integration` and `examples/clockwork_integration` showing both YAML and programmatic profile shapes
 
 Out (intentionally):
@@ -233,10 +233,6 @@ go-sandbox/
 │   ├── apply_linux_test.go
 │   ├── resolved_policy_integration_test.go
 │   └── integration_test.go
-├── internal/
-│   └── pathsafe/                      # internal — bounded path resolution
-│       ├── pathsafe.go
-│       └── pathsafe_test.go
 └── examples/
     ├── mux_integration/               # load profile YAML, apply to exec.Cmd
     │   ├── main.go
@@ -253,7 +249,7 @@ This package is a hybrid extraction from two sibling sandbox implementations (cu
 - **macOS backend + literal validator** — taken from `nanite`'s darwin sandbox impl (`validateSeatbeltLiteral`, seatbelt profile shape).
 - **Linux backend** — taken from `nanite`'s linux sandbox impl (narrowed mounts, namespace unsharing, conditional `--unshare-net`, `--die-with-parent`).
 - **Cleanup pattern** — taken from `nanite`'s `applyOSSandbox`. The earlier mux `Apply` leaked the temp profile file on darwin; the cleanup-function return added here closes that, and the regression is covered by tests — do not regress it.
-- **`internal/pathsafe`** — verbatim port of `nanite`'s internal `pathsafe` helper; kept internal and not re-exported.
+- **Path-escape rejection** — originally a verbatim port of `nanite`'s internal `pathsafe` helper; since v0.4.1 it is `go-safefs/pathsafe`, the shared extraction that carries the dangling-symlink fix.
 
 ## License
 

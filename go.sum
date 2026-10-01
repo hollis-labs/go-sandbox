@@ -1,3 +1,5 @@
+github.com/hollis-labs/go-safefs v0.1.0 h1:DOlOS/0OnLKgUXON9YiPTzZZyYhqogNUo9RoYpa7UOY=
+github.com/hollis-labs/go-safefs v0.1.0/go.mod h1:cy6lXh6KhPuIoQ9hGQSL+sd4N1dhJ1hE3sSCMXNB6JA=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
