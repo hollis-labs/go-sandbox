@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -327,5 +328,20 @@ func TestBuildResolvedSBPL_DenyGUILaunchComesAfterAllows(t *testing.T) {
 	}
 	if !strings.Contains(sbpl, "launchservicesd") {
 		t.Errorf("missing LaunchServices mach-lookup deny in:\n%s", sbpl)
+	}
+}
+
+// CW-20261001-0128: launchd would still run a job for the child, so darwin
+// refuses DenyUserServiceManager instead of ignoring it.
+func TestDarwinRefusesDenyUserServiceManager(t *testing.T) {
+	if _, err := BuildSBPL(Profile{ID: "p", DenyUserServiceManager: true}, t.TempDir()); !errors.Is(err, ErrUnsupportedPolicy) {
+		t.Errorf("BuildSBPL err = %v, want ErrUnsupportedPolicy", err)
+	}
+	resolved, err := ResolveAccessPolicy(AccessPolicy{ID: "p", Roots: Roots{Project: t.TempDir()}, DenyUserServiceManager: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildResolvedSBPL(resolved); !errors.Is(err, ErrUnsupportedPolicy) {
+		t.Errorf("BuildResolvedSBPL err = %v, want ErrUnsupportedPolicy", err)
 	}
 }

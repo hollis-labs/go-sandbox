@@ -105,9 +105,24 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
   - macOS legacy profiles are already default-allow.
 - **Boundary:**
   - Protect stops **direct writes** to the protected paths in every mode.
-  - Against writes **delegated** to another process, it holds only under a narrowed or resolved policy that doesn't mount the sockets involved. An example is `systemd-run --user` over `$XDG_RUNTIME_DIR/bus` or `$XDG_RUNTIME_DIR/systemd/private`.
+  - Against writes **delegated** to another process, it holds only under a narrowed or resolved policy that doesn't show the sockets involved (a read-only grant counts as showing them). An example is `systemd-run --user`; `DenyUserServiceManager` (below) closes that one in every mode.
   - **HostFilesystem mode is not an isolation boundary.** Its child reaches the user's runtime sockets, terminal-multiplexer sockets and the host apps' own APIs, and any same-uid service behind them can write for it. With `$HOME` writable it can also plant code that runs outside the sandbox later: `~/.bashrc`, `~/.config/systemd/user`, git hooks.
-  - Hiding `$XDG_RUNTIME_DIR` wholesale would break ssh-agent and the keyring, which uses the session bus. An opt-in to hide the systemd user-manager sockets is a follow-up.
+  - Hiding `$XDG_RUNTIME_DIR` wholesale would break ssh-agent and the keyring, which uses the session bus. `DenyUserServiceManager` hides only the user service manager's sockets and the session bus.
+- **Delegation through the user service manager (`DenyUserServiceManager`):**
+  - The systemd user manager runs whatever it's asked to, outside the sandbox and as the same uid: `systemd-run --user touch /protected/x` writes a protected path for the child.
+  - It answers on `$XDG_RUNTIME_DIR/systemd/` (its private socket and Varlink sockets) and on the session bus, where it is `org.freedesktop.systemd1`. With only `systemd/` hidden, `systemd-run --user --wait`, or any D-Bus client calling `StartTransientUnit`, still gets through the bus (measured on systemd 259).
+  - `DenyUserServiceManager: true` (on `Profile`, yaml `deny_user_service_manager`, `AccessPolicy` and `ResolvedAccessPolicy`) hides both on Linux, wherever the sandbox shows them. It puts an empty read-only tmpfs over each `systemd/` directory, and `/dev/null` over each of these: the session-bus socket, any `unix:path=` socket in `DBUS_SESSION_BUS_ADDRESS`, and any hard link to one of them planted in the runtime directory. The runtime directory and bus address come from the child's environment and the parent's, plus logind's `/run/user/<uid>`.
+  - **The cost:** the session bus goes too, and with it everything on it: the Secret Service keyring (`org.freedesktop.secrets`, gnome-keyring), notifications and portals. ssh-agent, gpg-agent and the other sockets in the runtime directory stay. Turn it on for agents that need no keyring.
+  - It applies wherever the runtime directory is visible, read-only grants included, since a read-only mount does not stop `connect(2)`.
+  - A session bus the mounts can't hide (an abstract socket or a TCP address) is refused while the sandbox shares the host network. With the network unshared it's unreachable anyway.
+  - The masks are mounts the child can't remove: it has no capabilities, and a nested user namespace would inherit them locked (`mount_namespaces(7)`).
+  - **macOS refuses it**, because launchd would still run a job for the child. A resolved policy asking for it reports `user-service-manager-deny` as unsupported there, which fails closed under required confinement.
+  - **Not covered:**
+    - Other same-uid services that act for a caller, such as a rootless docker or podman socket, a terminal multiplexer, or the host apps' own APIs.
+    - The system manager. polkit asks for interactive authentication, and the sandbox can't answer it.
+    - A hard link to the bus outside the runtime directory. When the runtime directory is not its own filesystem, a link elsewhere on that filesystem is not found.
+    - A second mount of the runtime directory's filesystem, as for Protect: the masks follow the paths found.
+    - A socket recreated during the session. The masks cover the sockets present at launch. If the host unlinks and recreates one (a dbus restart, a re-login), the kernel detaches the mask from the old file and the new socket is visible. The child can't cause that itself: it reaches neither the manager nor the bus, and can't signal host processes from its own pid namespace.
 - **Other limits:**
   - Protection follows the paths given. If the same directory is also reachable through a second host mount (a bind mount, a btrfs subvolume, a second mount of the same filesystem) that the sandbox exposes writable, writes through that path are not covered. Protect each path the sandbox can reach it by.
   - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead. A socket is not a directory, so it can't be protected anyway.

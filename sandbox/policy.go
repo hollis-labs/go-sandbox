@@ -152,7 +152,16 @@ type AccessPolicy struct {
 	// (open(1), LaunchServices). Backends that cannot enforce it report
 	// CapGUILaunchDeny as unsupported.
 	DenyGUILaunch bool
-	Legacy        LegacyCompatibility
+	// DenyUserServiceManager requests that the child cannot reach the user
+	// service manager, which would run a command for it outside the sandbox
+	// (`systemd-run --user`) and so write a protected path on its behalf.
+	// Linux bwrap hides the manager's sockets ($XDG_RUNTIME_DIR/systemd/)
+	// and the session bus, where the manager also answers: that also cuts
+	// the child off from everything else on the session bus, including the
+	// Secret Service keyring, notifications and portals. Backends that cannot
+	// enforce it report CapUserServiceManagerDeny as unsupported.
+	DenyUserServiceManager bool
+	Legacy                 LegacyCompatibility
 }
 
 // ResolvedRoots contains absolute, symlink-normalized root paths.
@@ -210,7 +219,9 @@ type ResolvedAccessPolicy struct {
 	Network       NetworkAccess
 	Subprocess    SubprocessMode
 	DenyGUILaunch bool
-	Legacy        LegacyCompatibility
+	// DenyUserServiceManager: see AccessPolicy.DenyUserServiceManager.
+	DenyUserServiceManager bool
+	Legacy                 LegacyCompatibility
 }
 
 // AccessDecision is the effective child access for a path after deny
@@ -278,7 +289,8 @@ func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
 		Subprocess: p.Subprocess,
 		Legacy:     p.Legacy,
 
-		DenyGUILaunch: p.DenyGUILaunch,
+		DenyGUILaunch:          p.DenyGUILaunch,
+		DenyUserServiceManager: p.DenyUserServiceManager,
 	}
 
 	if resolved.FS.Read, err = resolvePathRefs(AccessRead, p.FS.Read, roots); err != nil {
@@ -405,6 +417,8 @@ func (p ResolvedAccessPolicy) LegacyProfile() Profile {
 		LoopbackForwardPorts: slices.Clone(p.Network.LoopbackPorts),
 		Subprocess:           p.Subprocess != SubprocessDeny,
 		DenyGUILaunch:        p.DenyGUILaunch,
+
+		DenyUserServiceManager: p.DenyUserServiceManager,
 	}
 	for _, item := range p.allReads() {
 		profile.FS.Read = append(profile.FS.Read, item.Path)
@@ -448,8 +462,9 @@ func PolicyFromProfile(p Profile, workspace string) AccessPolicy {
 			Mode:          legacyNetworkMode(p),
 			LoopbackPorts: slices.Clone(p.LoopbackForwardPorts),
 		},
-		Subprocess:    legacySubprocessMode(p),
-		DenyGUILaunch: p.DenyGUILaunch,
+		Subprocess:             legacySubprocessMode(p),
+		DenyGUILaunch:          p.DenyGUILaunch,
+		DenyUserServiceManager: p.DenyUserServiceManager,
 		Legacy: LegacyCompatibility{
 			Enabled:      true,
 			Source:       "Profile",
@@ -473,7 +488,9 @@ const (
 	CapSubprocessDeny      Capability = "subprocess-deny"
 	CapGUILaunchDeny       Capability = "gui-launch-deny"
 	CapWriteProtect        Capability = "write-protect"
-	CapDisabledMode        Capability = "disabled-mode"
+	// CapUserServiceManagerDeny is AccessPolicy.DenyUserServiceManager.
+	CapUserServiceManagerDeny Capability = "user-service-manager-deny"
+	CapDisabledMode           Capability = "disabled-mode"
 )
 
 // BackendCapabilities reports what a selected backend can honestly enforce.
@@ -531,6 +548,7 @@ func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapab
 			CapLoopback,
 			CapLoopbackForward,
 			CapWriteProtect,
+			CapUserServiceManagerDeny,
 		}
 	default:
 		caps.Supported = false
@@ -1084,6 +1102,9 @@ func requiredCapabilities(p ResolvedAccessPolicy) []Capability {
 	}
 	if p.DenyGUILaunch {
 		add(CapGUILaunchDeny)
+	}
+	if p.DenyUserServiceManager {
+		add(CapUserServiceManagerDeny)
 	}
 	return caps
 }

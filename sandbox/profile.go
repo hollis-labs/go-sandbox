@@ -56,6 +56,13 @@ type Profile struct {
 	// LaunchServices); Linux bwrap does not enforce it, and a resolved policy
 	// that requires it is refused there (see CapGUILaunchDeny).
 	DenyGUILaunch bool `yaml:"deny_gui_launch"`
+	// DenyUserServiceManager stops the session reaching the user service
+	// manager, which would otherwise run a command for it outside the
+	// sandbox (`systemd-run --user`): a write delegated past FS.Protect, for
+	// one. Linux hides $XDG_RUNTIME_DIR/systemd/ and the session bus, which
+	// also breaks the Secret Service keyring and everything else on the
+	// session bus; macOS refuses it. See AccessPolicy.DenyUserServiceManager.
+	DenyUserServiceManager bool `yaml:"deny_user_service_manager"`
 	// HostFilesystem gives the session the host filesystem as the parent sees
 	// it, writable, instead of Linux bwrap's narrowed system mounts; only
 	// FS.Protect narrows it. It is the minimal sandbox for a host whose agents

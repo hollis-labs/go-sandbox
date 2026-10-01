@@ -3,6 +3,66 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.6.0 — 2026-10-01
+
+Stop writes delegated to the user service manager (CW-20261001-0128).
+
+### Added
+
+- **`DenyUserServiceManager`** on `AccessPolicy`, `ResolvedAccessPolicy` and
+  the legacy `Profile` (yaml `deny_user_service_manager`), with the
+  `user-service-manager-deny` capability (`CapUserServiceManagerDeny`).
+  - It stops the child reaching the user service manager, which would run a
+    command for it outside the sandbox: `systemd-run --user touch
+    /protected/x` gets past `FS.Protect` in HostFilesystem mode, or under any
+    grant that shows `$XDG_RUNTIME_DIR`.
+  - Measured on systemd 259: the manager answers on
+    `$XDG_RUNTIME_DIR/systemd/` (its private socket and Varlink sockets), and
+    on the session bus as `org.freedesktop.systemd1`. With only `systemd/`
+    hidden, `systemd-run --user --wait` and any D-Bus client still get through
+    the bus. So the option hides both.
+- **Linux enforcement:** the masks come after every other mount, wherever the
+  sandbox shows the path. That includes read-only grants, since a read-only
+  mount does not stop `connect(2)`. It applies to legacy `Apply` (narrowed
+  and HostFilesystem), `ApplyResolved` and `BuildResolvedBwrap`.
+  - Each `systemd/` directory gets an empty read-only tmpfs.
+  - `/dev/null` goes over each of these:
+    - the session-bus socket;
+    - any `unix:path=` socket in `DBUS_SESSION_BUS_ADDRESS`;
+    - any hard link to one of them, or to a socket under `systemd/`, planted
+      in the runtime directory. The search skips other mounts beneath it,
+      untouched.
+  - The runtime directory and bus address come from the child's environment
+    and the parent's, plus logind's `/run/user/<uid>`.
+  - Other sockets in the runtime directory (ssh-agent, gpg-agent) stay.
+- **What it refuses:**
+  - A session-bus address the mounts can't hide (an abstract socket, or a TCP
+    address) while the sandbox shares the host network.
+  - Any other bus transport.
+  - A runtime directory it can't fully search for links.
+- **Not covered:**
+  - Other same-uid services that act for a caller (a rootless container
+    socket, a terminal multiplexer).
+  - A second mount of the runtime directory's filesystem.
+  - A socket the host recreates during the session (a dbus restart). That
+    detaches its mask. The child can't cause it.
+- **The cost:** everything else on the session bus goes too, including the
+  Secret Service keyring, notifications and portals. It is for hosts whose
+  agents need no keyring (Torque, Hadron).
+- **macOS refuses it** (`BuildSBPL`, `BuildResolvedSBPL`), because launchd
+  would still run a job for the child. Resolved policies report the
+  capability as unsupported, which fails closed under required confinement.
+- **Tests:**
+  - Real bwrap, both directions: under a HostFilesystem profile protecting a
+    directory, `systemd-run --user --wait` writes into it from outside without
+    the option. With the option it can't, by the bus or the private socket,
+    and `busctl --user` can't reach the manager.
+  - A resolved policy whose read grant shows the runtime directory: the bus
+    answers without the option, and doesn't with it.
+  - The masks leave other sockets alone, catch planted hard links, and come
+    after the protect binds.
+  - Removing the socket masks, or the hard-link search, fails these tests.
+
 ## v0.5.1 — 2026-10-01
 
 ### Fixed
