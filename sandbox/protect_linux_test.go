@@ -570,3 +570,37 @@ func TestBwrapProtectResolvedPinsBeforeReadMounts(t *testing.T) {
 		t.Fatalf("want the pin on %s before the read mount of %s: %v", filepath.Join(w, "a"), project, args)
 	}
 }
+
+// A host-filesystem profile shows the whole host, so Apply must run the
+// command at the path the caller gave. v0.5.0 rewrote a symlinked command
+// to its resolved target (the narrowed profile's "not visible, bind the
+// target" path), changing argv[0]: a multi-call binary or a launcher that
+// dispatches on its own name then did something else entirely.
+func TestApplyHostFilesystemKeepsSymlinkedCommandPath(t *testing.T) {
+	requireBwrapLinux(t)
+	dir := realDir(t)
+	// The target lives outside the workspace (as an installed CLI does), so
+	// the narrowed visibility check would not see it.
+	target := filepath.Join(realDir(t), "real-tool")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\nprintf '%s' \"$0\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "tool-shim")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(link)
+	cmd.Dir = dir
+	cleanup, err := Apply(cmd, Profile{ID: "host", HostFilesystem: true, Net: true, Subprocess: true, FS: FSSpec{Protect: []string{realDir(t)}}}, dir)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer cleanup()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if string(out) != link {
+		t.Fatalf("$0 = %q, want the symlinked path %q (argv[0] rewritten to the target)", out, link)
+	}
+}

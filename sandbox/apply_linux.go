@@ -463,6 +463,11 @@ func legacyBwrapMountParentDirs(workspace string, p Profile, helperPath, bridgeD
 }
 
 func pathVisibleInSandbox(target, workspace string, p Profile) bool {
+	// A host-filesystem profile binds / itself: everything the parent sees,
+	// the child sees at the same path.
+	if p.HostFilesystem {
+		return true
+	}
 	if pathWithinBind(target, workspace) {
 		return true
 	}
