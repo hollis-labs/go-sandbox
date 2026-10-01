@@ -129,6 +129,48 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 		b.WriteString("\n")
 	}
 
+	// Write-protected paths: after every write allow, so they win. Seatbelt
+	// matches real paths, so each is canonicalized (/tmp/x is
+	// /private/tmp/x) and writeProtectDenies adds the alias back.
+	protected := make([]string, 0, len(p.FS.Protect))
+	for i, raw := range p.FS.Protect {
+		path, err := expandAndValidate(fmt.Sprintf("FS.Protect[%d]", i), raw, absWS)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf("%w: protected path %q must be absolute (or ~/..., or workspace)", ErrUnsupportedPolicy, raw)
+		}
+		if err := validateProtectPath(path); err != nil {
+			return "", err
+		}
+		canonical, err := canonicalPath(path)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: resolve protected path %q: %w", raw, err)
+		}
+		protected = append(protected, canonical)
+	}
+	if err := validateProtectSet(protected); err != nil {
+		return "", err
+	}
+	writes := []string{absWS}
+	for _, raw := range p.FS.Write {
+		if path := expandPath(raw, absWS); filepath.IsAbs(path) {
+			if canonical, err := canonicalPath(path); err == nil {
+				writes = append(writes, canonical)
+			}
+		}
+	}
+	if canonical, err := canonicalPath(absWS); err == nil {
+		writes = append(writes, canonical)
+	}
+	if err := validateWritesOutsideProtect(writes, protected); err != nil {
+		return "", err
+	}
+	if err := writeProtectDenies(&b, protected); err != nil {
+		return "", err
+	}
+
 	if !p.Net {
 		if p.AllowLoopback {
 			if err := writeLoopbackAllows(&b); err != nil {
@@ -185,6 +227,9 @@ func BuildResolvedSBPL(p ResolvedAccessPolicy) (string, error) {
 		return "", err
 	}
 	if err := writeResolvedDenies(&b, resolvedPathStrings(p.allDenies())); err != nil {
+		return "", err
+	}
+	if err := writeProtectDenies(&b, resolvedPathStrings(p.FS.Protect)); err != nil {
 		return "", err
 	}
 
@@ -252,14 +297,6 @@ func existingDarwinPaths(paths []string) []string {
 	return out
 }
 
-func resolvedPathStrings(paths []ResolvedPath) []string {
-	out := make([]string, 0, len(paths))
-	for _, path := range paths {
-		out = append(out, path.Path)
-	}
-	return out
-}
-
 func writeResolvedReadAllows(b *strings.Builder, paths []string) error {
 	if len(paths) == 0 {
 		return nil
@@ -308,6 +345,53 @@ func writeResolvedDenies(b *strings.Builder, paths []string) error {
 		}
 		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
 			return err
+		}
+	}
+	b.WriteString("\n")
+	return nil
+}
+
+// writeProtectDenies emits the write denies for write-protected paths
+// (FilesystemAccess.Protect, Profile.FS.Protect). They must follow every
+// write allow so they take precedence; they leave reads to the rules above.
+// Seatbelt matches by path, so a protected path that does not exist yet is
+// protected too, unlike Linux bwrap.
+//
+// Each ancestor is also denied writes by literal: the entry itself, not its
+// contents. Without it the child could rename an ancestor away and put a
+// symlink to its own directory in its place, so the protected path resolves
+// somewhere writable (the macOS form of the rename the Linux backend blocks by
+// pinning ancestors).
+func writeProtectDenies(b *strings.Builder, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	b.WriteString("; Write-protected paths: never writable, whatever allows them above.\n")
+	seen := map[string]bool{}
+	for _, path := range paths {
+		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
+			return err
+		}
+		// Hard links: a link to a protected file from a writable directory
+		// would be a second, unprotected name for the same file. Seatbelt
+		// may check link creation as its own operation, separate from
+		// file-write* on the new name, so deny it explicitly. (Linux refuses
+		// it with EXDEV across the bind.) Not yet run on a Mac.
+		if err := writeSeatbeltPathRule(b, "deny", "file-link", path); err != nil {
+			return err
+		}
+		for dir := filepath.Dir(path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+			if seen[dir] {
+				continue
+			}
+			seen[dir] = true
+			aliases, err := seatbeltAliases([]string{dir})
+			if err != nil {
+				return err
+			}
+			for _, alias := range aliases {
+				fmt.Fprintf(b, "(deny file-write* (literal \"%s\"))\n", alias)
+			}
 		}
 	}
 	b.WriteString("\n")

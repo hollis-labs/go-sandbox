@@ -3,6 +3,106 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.0 — 2026-10-01
+
+Write-protected control-plane paths (CW-20260930-0237).
+
+### Added
+
+- **`FS.Protect`** on `FilesystemAccess`, `ResolvedFilesystemAccess` (with
+  the `AccessProtect` kind) and the legacy `Profile.FS` (yaml `protect`).
+  - It lists directories the child must never write, even inside a write
+    grant: a host's state, database, config, catalog or allow-lists. An
+    agent running as the operator's uid could otherwise rewrite them to
+    grant itself authority.
+  - A protected directory stays readable where a grant covers it, and
+    grants nothing. `Deny` still overrides it.
+  - `AccessFor` reports it as read-only, or no-grant when nothing covers
+    it.
+- **What it accepts:**
+  - **No write grants inside.** A write grant or workspace at or inside a
+    protected directory is refused on both platforms
+    (`ResolveAccessPolicy`, `WithProtected` and the legacy builders). On
+    Linux the grant stayed writable through the protection, and an outer
+    protect even disabled an inner one's bind.
+  - **Directories only.** A file entry is refused unless a protected
+    directory covers it: the file's directory stays writable, so the host's
+    own atomic save, or a sidecar planted beside it (SQLite's `-wal`),
+    defeats file-level protection.
+  - **Absolute paths only.**
+  - **No re-pointable symlinks.** An entry that goes through a symlink in a
+    directory the uid can write is refused: protect the real path.
+    - A directory the uid owns counts as writable even at 0555.
+    - The check follows the whole resolution, including link targets.
+- **The `write-protect` capability (`CapWriteProtect`)**, provided by linux
+  bwrap and darwin seatbelt. `AssessEnforcement` requires it when a
+  resolved policy protects anything.
+- **`ResolvedAccessPolicy.WithProtected(paths...)`** adds absolute paths to
+  an already-resolved policy, canonicalized, deduplicated and validated the
+  same way. This is how a host composes its control-plane paths into a
+  policy built elsewhere.
+- **`Profile.HostFilesystem`** (yaml `host_filesystem`) is the minimal
+  protect-only sandbox for hosts whose agents otherwise run unconfined.
+  - On Linux it binds the host filesystem writable with devices
+    (`--dev-bind / /`).
+  - It gives the child a private pid namespace and `/proc`, and requires the
+    user namespace (`--unshare-user`) when anything is protected. Together
+    these make the kernel refuse `/proc/<pid>/root` and ptrace of host
+    processes.
+  - It shares the ipc and uts namespaces and the session. There is no
+    `--new-session`, because a PTY needs its controlling terminal.
+  - It unshares the network only when `Net` is false, and refuses `FS.Deny`.
+  - macOS legacy profiles are already default-allow.
+- **Linux enforcement:** each protected directory is read-only-bound where
+  the child sees it, over the writable mounts and under the deny overlays.
+  - This applies to legacy `Apply`, `ApplyResolved` and `BuildResolvedBwrap`.
+  - **Pins:** every ancestor the child could rename is first bound onto
+    itself, rw, except inside a protected directory. A mount point can't be
+    renamed or removed (EBUSY), so the child can't `mv /W /W2` to carry the
+    read-only mount away and recreate `/W/state` for the host to read. Pins
+    come before any read mount in legacy and resolved mode alike, so they
+    never cover a read-only grant beneath them.
+  - **Nested protected directories:** every protected directory under a
+    writable mount is bound, nested or not.
+  - **Symlinked roots:** a workspace or write root reached through a symlink
+    gets the bind at its symlinked path. An existing protected directory
+    under a writable mount that ends up unbound fails the launch.
+  - **Missing paths:** a protected path that doesn't exist is refused where
+    the child could create it, and skipped elsewhere.
+  - Writes, creates, renames, unlinks, mkdir, hard links and planted
+    sidecars inside a protected directory all fail. This is pinned by
+    real-bwrap tests, each of which fails without its fix.
+- **macOS enforcement:** `BuildSBPL` and `BuildResolvedSBPL` emit
+  `(deny file-write* …)` and `(deny file-link …)` for each protected path.
+  They use its real path plus the `/tmp` or `/var` alias, and come after
+  every write allow.
+  - Each ancestor also gets a literal write deny (the entry, not its
+    contents).
+  - **Not run on a Mac.** These were checked by reasoning and by darwin-only
+    tests compiled with `GOOS=darwin`. `file-link` must be confirmed as an
+    operation `sandbox-exec` accepts before release.
+
+### Not covered
+
+- **Boundary:**
+  - Protect stops direct writes to the protected paths in every mode.
+  - Against writes delegated to another process (for example
+    `systemd-run --user` over `$XDG_RUNTIME_DIR/bus` or
+    `$XDG_RUNTIME_DIR/systemd/private`), it holds only under a narrowed or
+    resolved policy that doesn't mount those sockets.
+  - HostFilesystem mode is not an isolation boundary. Its child reaches the
+    user's runtime sockets, terminal-multiplexer sockets and the host apps'
+    own APIs. With `$HOME` writable it can plant code that runs outside the
+    sandbox later: `~/.bashrc`, `~/.config/systemd/user`, git hooks.
+  - `$XDG_RUNTIME_DIR` is not hidden wholesale: that would break ssh-agent
+    and the keyring. An opt-in to hide the systemd user-manager sockets is a
+    backlog follow-up.
+- A read-only mount doesn't stop `connect(2)` on a Unix socket. Use `Deny`
+  for a control socket.
+- **Second host mounts:** protection follows the paths given. A directory
+  also reachable through a second host mount the sandbox exposes writable
+  (a bind mount, a btrfs subvolume) is not covered on that path.
+
 ## v0.4.1 — 2026-10-01
 
 Security fix (CW-20261001-0057).

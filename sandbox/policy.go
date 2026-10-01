@@ -57,11 +57,19 @@ type PathRef struct {
 // FilesystemAccess is the child process filesystem policy. Deny rules always
 // take precedence over read and write grants. SourceRead entries are resolved
 // and recorded for provenance, but are not child execution grants.
+//
+// Protect lists paths the child must never write, even inside a Write grant:
+// control-plane state such as a host's database, config or allow-lists, which
+// a same-uid agent could otherwise rewrite to grant itself authority
+// (CW-20260930-0237). Protection is narrower than Deny (the child may still
+// read a protected path that a grant covers) and grants nothing: a protected
+// path outside every grant stays invisible. Deny overrides Protect.
 type FilesystemAccess struct {
 	Read       []PathRef
 	Write      []PathRef
 	Deny       []PathRef
 	SourceRead []PathRef
+	Protect    []PathRef
 }
 
 // RuntimeAccess declares host runtime files the backend must make readable,
@@ -165,6 +173,7 @@ const (
 	AccessDeny        AccessKind = "deny"
 	AccessSourceRead  AccessKind = "source-read"
 	AccessRuntimeRead AccessKind = "runtime-read"
+	AccessProtect     AccessKind = "protect"
 )
 
 // ResolvedPath is a normalized access rule.
@@ -176,12 +185,15 @@ type ResolvedPath struct {
 }
 
 // ResolvedFilesystemAccess is the concrete filesystem policy. Write grants
-// imply read access. Deny grants override both read and write.
+// imply read access. Deny grants override both read and write. Protect
+// overrides write: a protected path is at most read-only (see
+// FilesystemAccess.Protect).
 type ResolvedFilesystemAccess struct {
 	Read       []ResolvedPath
 	Write      []ResolvedPath
 	Deny       []ResolvedPath
 	SourceRead []ResolvedPath
+	Protect    []ResolvedPath
 }
 
 // ResolvedAccessPolicy is the normalized sandbox request consumed by backend
@@ -281,6 +293,15 @@ func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
 	if resolved.FS.SourceRead, err = resolvePathRefs(AccessSourceRead, p.FS.SourceRead, roots); err != nil {
 		return ResolvedAccessPolicy{}, err
 	}
+	if resolved.FS.Protect, err = resolvePathRefs(AccessProtect, p.FS.Protect, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if err := validateProtectSet(resolvedPathStrings(resolved.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if err := validateWritesOutsideProtect(resolvedPathStrings(resolved.allWrites()), resolvedPathStrings(resolved.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
 
 	if p.Runtime.Executable != (PathRef{}) {
 		exe, err := resolvePathRef(AccessRuntimeRead, p.Runtime.Executable, roots)
@@ -327,6 +348,12 @@ func (p ResolvedAccessPolicy) AccessFor(path string) AccessDecision {
 	if containsPath(p.allDenies(), resolved) {
 		return AccessDenied
 	}
+	if containsPath(p.FS.Protect, resolved) {
+		if containsPath(p.allWrites(), resolved) || containsPath(p.allReads(), resolved) {
+			return AccessReadOnly
+		}
+		return AccessNoGrant
+	}
 	if containsPath(p.allWrites(), resolved) {
 		return AccessReadWrite
 	}
@@ -334,6 +361,35 @@ func (p ResolvedAccessPolicy) AccessFor(path string) AccessDecision {
 		return AccessReadOnly
 	}
 	return AccessNoGrant
+}
+
+// WithProtected returns a copy of p that also write-protects paths (see
+// FilesystemAccess.Protect). Each path must be absolute; it is canonicalized
+// the way ResolveAccessPolicy canonicalizes absolute refs. It is how a host
+// adds its control-plane paths to a policy that was resolved elsewhere.
+func (p ResolvedAccessPolicy) WithProtected(paths ...string) (ResolvedAccessPolicy, error) {
+	out := p
+	out.FS.Protect = slices.Clone(p.FS.Protect)
+	for _, raw := range paths {
+		if !filepath.IsAbs(raw) {
+			return ResolvedAccessPolicy{}, fmt.Errorf("sandbox: protected path %q must be absolute", raw)
+		}
+		resolved, err := resolvePathRef(AccessProtect, PathRef{Path: raw}, ResolvedRoots{})
+		if err != nil {
+			return ResolvedAccessPolicy{}, err
+		}
+		if !slices.ContainsFunc(out.FS.Protect, func(r ResolvedPath) bool { return r.Path == resolved.Path }) {
+			out.FS.Protect = append(out.FS.Protect, resolved)
+		}
+	}
+	if err := validateProtectSet(resolvedPathStrings(out.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if err := validateWritesOutsideProtect(resolvedPathStrings(out.allWrites()), resolvedPathStrings(out.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	sortResolvedPolicy(&out)
+	return out, nil
 }
 
 // LegacyProfile converts a resolved policy into the legacy Profile shape. This
@@ -359,6 +415,9 @@ func (p ResolvedAccessPolicy) LegacyProfile() Profile {
 	for _, item := range p.allDenies() {
 		profile.FS.Deny = append(profile.FS.Deny, item.Path)
 	}
+	for _, item := range p.FS.Protect {
+		profile.FS.Protect = append(profile.FS.Protect, item.Path)
+	}
 	return profile
 }
 
@@ -380,9 +439,10 @@ func PolicyFromProfile(p Profile, workspace string) AccessPolicy {
 		Backend: BackendAuto,
 		Roots:   roots,
 		FS: FilesystemAccess{
-			Read:  pathRefsFromLegacy(p.FS.Read),
-			Write: pathRefsFromLegacy(p.FS.Write),
-			Deny:  pathRefsFromLegacy(p.FS.Deny),
+			Read:    pathRefsFromLegacy(p.FS.Read),
+			Write:   pathRefsFromLegacy(p.FS.Write),
+			Deny:    pathRefsFromLegacy(p.FS.Deny),
+			Protect: pathRefsFromLegacy(p.FS.Protect),
 		},
 		Network: NetworkAccess{
 			Mode:          legacyNetworkMode(p),
@@ -412,6 +472,7 @@ const (
 	CapLoopbackForward     Capability = "loopback-forward"
 	CapSubprocessDeny      Capability = "subprocess-deny"
 	CapGUILaunchDeny       Capability = "gui-launch-deny"
+	CapWriteProtect        Capability = "write-protect"
 	CapDisabledMode        Capability = "disabled-mode"
 )
 
@@ -456,6 +517,7 @@ func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapab
 			CapNetworkDeny,
 			CapLoopback,
 			CapGUILaunchDeny,
+			CapWriteProtect,
 		}
 	case BackendLinuxBwrap:
 		caps.Supported = goos == "linux"
@@ -468,6 +530,7 @@ func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapab
 			CapNetworkDeny,
 			CapLoopback,
 			CapLoopbackForward,
+			CapWriteProtect,
 		}
 	default:
 		caps.Supported = false
@@ -620,6 +683,14 @@ func resolvePathRef(kind AccessKind, ref PathRef, roots ResolvedRoots) (Resolved
 		if ref.Path == "" {
 			return ResolvedPath{}, fmt.Errorf("sandbox: %s path ref needs root or path", kind)
 		}
+		if kind == AccessProtect {
+			if !filepath.IsAbs(ref.Path) {
+				return ResolvedPath{}, fmt.Errorf("sandbox: protected path %q must be absolute or under a root", ref.Path)
+			}
+			if err := validateProtectPath(ref.Path); err != nil {
+				return ResolvedPath{}, err
+			}
+		}
 		path, err := canonicalPath(ref.Path)
 		if err != nil {
 			return ResolvedPath{}, fmt.Errorf("sandbox: resolve %s path %q: %w", kind, ref.Path, err)
@@ -634,11 +705,152 @@ func resolvePathRef(kind AccessKind, ref PathRef, roots ResolvedRoots) (Resolved
 	if rel == "" {
 		rel = "."
 	}
+	if kind == AccessProtect {
+		if err := validateProtectPath(filepath.Join(root, rel)); err != nil {
+			return ResolvedPath{}, err
+		}
+	}
 	path, err := pathsafe.ResolveUnder(root, rel)
 	if err != nil {
 		return ResolvedPath{}, fmt.Errorf("sandbox: resolve %s under %s: %w", kind, ref.Root, err)
 	}
 	return ResolvedPath{Kind: kind, Root: ref.Root, Path: path, Source: rel}, nil
+}
+
+// validateProtectPath refuses a protected path the child could re-point: one
+// with a symlink component in a directory the current uid can write. The
+// backends protect the path the symlink resolves to at launch; the child
+// could then swap the link (`ln -s evil x.new && mv -T x.new x`) and the
+// host would follow it somewhere writable. Symlinks in directories the uid
+// cannot write (/var -> /private/var on macOS) are fixed and allowed. A
+// host passes the real path instead.
+//
+// It follows the whole resolution, not just the path as written: a fixed
+// symlink whose target goes through a re-pointable one is refused too.
+func validateProtectPath(path string) error {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("sandbox: protected path %q must be absolute", path)
+	}
+	walk := path
+	for hops := 0; ; hops++ {
+		if hops > maxPolicySymlinkFollow {
+			return fmt.Errorf("sandbox: too many symlinks resolving protected path %q", path)
+		}
+		next, err := protectWalkStep(path, walk)
+		if err != nil || next == "" {
+			return err
+		}
+		walk = next
+	}
+}
+
+// protectDirWritable is uidCanWrite, a variable so a test can mark a
+// directory fixed: a non-root test cannot make one the uid neither owns nor
+// can write.
+var protectDirWritable = uidCanWrite
+
+// protectWalkStep walks walk component by component until the first
+// symlink. It refuses that symlink if the uid can write its directory, and
+// otherwise returns the path with the link replaced by its target, to walk
+// again. It returns "" once walk has no symlink left (or stops existing).
+func protectWalkStep(path, walk string) (string, error) {
+	sep := string(filepath.Separator)
+	parts := strings.Split(strings.TrimPrefix(walk, sep), sep)
+	prefix := sep
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parent := prefix
+		prefix = filepath.Join(prefix, part)
+		info, err := os.Lstat(prefix)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", nil
+			}
+			return "", fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		if protectDirWritable(parent) {
+			return "", fmt.Errorf("%w: protected path %q goes through symlink %q in writable directory %q, which the sandboxed process could re-point; protect the real path", ErrUnsupportedPolicy, path, prefix, parent)
+		}
+		target, err := os.Readlink(prefix)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(parent, target)
+		}
+		return filepath.Join(append([]string{target}, parts[i+1:]...)...), nil
+	}
+	return "", nil
+}
+
+// validateProtectSet refuses protected paths that are not directories (unless
+// a protected directory already covers them). A file's directory stays
+// writable, which defeats file-level protection: the host's own atomic save
+// (write a temp file, rename it over the original) replaces the file the
+// sandbox protected, and a database's sidecar (SQLite's -wal, -journal) can
+// be planted beside it and read by the host. Protect the directory. paths are
+// canonical.
+func validateProtectSet(paths []string) error {
+	var dirs []string
+	type entry struct {
+		path string
+		dir  bool
+	}
+	var entries []entry
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+		}
+		entries = append(entries, entry{path, info.IsDir()})
+		if info.IsDir() {
+			dirs = append(dirs, path)
+		}
+	}
+	for _, e := range entries {
+		if e.dir {
+			continue
+		}
+		if slices.ContainsFunc(dirs, func(dir string) bool { return dir != e.path && pathContains(dir, e.path) }) {
+			continue
+		}
+		return fmt.Errorf("%w: protected path %q is not a directory; protect its directory (a file's directory stays writable, so an atomic save or a database sidecar beside it defeats file-level protection)", ErrUnsupportedPolicy, e.path)
+	}
+	return nil
+}
+
+// validateWritesOutsideProtect refuses a write grant (or workspace) at or
+// inside a protected directory. Protect wins over write on macOS, where the
+// write deny follows the allow, but on Linux a writable mount inside a
+// protected directory would stay writable, so the platforms would disagree;
+// the policy is refused instead of guessing which the host meant. writes and
+// protected are canonical.
+func validateWritesOutsideProtect(writes, protected []string) error {
+	for _, write := range writes {
+		for _, dir := range protected {
+			if pathContains(dir, write) {
+				return fmt.Errorf("%w: write grant %q is inside protected path %q; a protected tree cannot also be granted writes", ErrUnsupportedPolicy, write, dir)
+			}
+		}
+	}
+	return nil
+}
+
+func resolvedPathStrings(paths []ResolvedPath) []string {
+	out := make([]string, 0, len(paths))
+	for _, item := range paths {
+		out = append(out, item.Path)
+	}
+	return out
 }
 
 func rootPath(roots ResolvedRoots, name RootName) (string, error) {
@@ -807,6 +1019,7 @@ func sortResolvedPolicy(p *ResolvedAccessPolicy) {
 	sortPaths(p.FS.Write)
 	sortPaths(p.FS.Deny)
 	sortPaths(p.FS.SourceRead)
+	sortPaths(p.FS.Protect)
 	sortPaths(p.Runtime)
 	sortPaths(p.ProviderState.Read)
 	sortPaths(p.ProviderState.Write)
@@ -840,6 +1053,9 @@ func requiredCapabilities(p ResolvedAccessPolicy) []Capability {
 	}
 	if len(p.FS.Deny) > 0 {
 		add(CapDenyPrecedence)
+	}
+	if len(p.FS.Protect) > 0 {
+		add(CapWriteProtect)
 	}
 	if len(p.Runtime) > 0 {
 		add(CapRuntimeReads)
