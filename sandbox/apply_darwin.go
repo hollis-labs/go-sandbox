@@ -153,6 +153,20 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 	if err := validateProtectSet(protected); err != nil {
 		return "", err
 	}
+	writes := []string{absWS}
+	for _, raw := range p.FS.Write {
+		if path := expandPath(raw, absWS); filepath.IsAbs(path) {
+			if canonical, err := canonicalPath(path); err == nil {
+				writes = append(writes, canonical)
+			}
+		}
+	}
+	if canonical, err := canonicalPath(absWS); err == nil {
+		writes = append(writes, canonical)
+	}
+	if err := validateWritesOutsideProtect(writes, protected); err != nil {
+		return "", err
+	}
 	if err := writeProtectDenies(&b, protected); err != nil {
 		return "", err
 	}

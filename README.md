@@ -82,12 +82,16 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
   - `ResolvedAccessPolicy.WithProtected(paths...)` adds absolute paths to a policy resolved elsewhere.
   - It is reported as the `write-protect` capability, which both backends provide.
 - **What may be protected:**
+  - **No write grants inside.** A write grant or workspace at or inside a protected directory is refused on both platforms. On Linux it would stay writable through the protection; on macOS the deny would win. Refusing it means the platforms can't disagree.
   - **Directories only.** A file's directory stays writable, so the host's own atomic save (rename over the file) or a database sidecar planted beside it (SQLite's `-wal`) defeats file-level protection. A non-directory entry is refused unless a protected directory covers it.
   - **Absolute paths only.** A relative entry is refused.
   - **No re-pointable symlinks.** An entry that goes through a symlink in a directory the uid can write is refused, because the child could swap the link after launch. Pass the real path.
+    - A directory the uid owns counts as writable even at 0555, because its owner can chmod it back.
+    - The check follows the whole resolution, including link targets, so a fixed symlink whose target crosses a re-pointable one is refused too.
 - **Linux:** bwrap read-only-binds each protected directory over the writable mounts, so writes, creates, renames and unlinks inside it fail.
   - Every ancestor the child could rename is bound onto itself first, rw. A mount point can't be renamed or removed, so the child can't `mv` the protected tree aside and recreate it with its own content.
-  - The pins come before any read mount, so they never cover a read-only grant beneath them.
+  - The pins come before any read mount, in legacy and resolved mode alike, so they never cover a read-only grant beneath them.
+  - Every protected directory under a writable mount is bound, including one nested inside another protected directory, and the fail-closed check covers each.
   - Binds go where the child sees the path. A workspace or write root reached through a symlink gets the bind at its symlinked path, and an existing protected directory under a writable mount that can't be bound fails the launch.
   - A protected path that does not exist cannot be bound without creating it on the host. Where the child could create it, it is refused at launch; create it first or protect its existing parent. Elsewhere it is skipped.
 - **macOS:** seatbelt denies `file-write*` and `file-link` on each protected path, by its real path and the `/tmp` or `/var` alias, after every allow.
@@ -105,6 +109,7 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
   - **HostFilesystem mode is not an isolation boundary.** Its child reaches the user's runtime sockets, terminal-multiplexer sockets and the host apps' own APIs, and any same-uid service behind them can write for it. With `$HOME` writable it can also plant code that runs outside the sandbox later: `~/.bashrc`, `~/.config/systemd/user`, git hooks.
   - Hiding `$XDG_RUNTIME_DIR` wholesale would break ssh-agent and the keyring, which uses the session bus. An opt-in to hide the systemd user-manager sockets is a follow-up.
 - **Other limits:**
+  - Protection follows the paths given. If the same directory is also reachable through a second host mount (a bind mount, a btrfs subvolume, a second mount of the same filesystem) that the sandbox exposes writable, writes through that path are not covered. Protect each path the sandbox can reach it by.
   - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead. A socket is not a directory, so it can't be protected anyway.
 
 Existing callers can continue using `Profile` directly:

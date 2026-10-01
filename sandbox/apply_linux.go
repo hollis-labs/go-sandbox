@@ -329,8 +329,19 @@ func planProtect(paths []string, roots []protectRoot) (protectPlan, error) {
 		}
 		dirs = append(dirs, path)
 	}
-	nested := func(path string) bool {
-		return slices.ContainsFunc(dirs, func(dir string) bool { return dir != path && pathUnderAny(path, []string{dir}) })
+	// A writable mount at or inside a protected directory would stay
+	// writable through the read-only bind over its parent, so the tree would
+	// not be protected at all: refuse it (validateWritesOutsideProtect makes
+	// the same call for resolved policies).
+	for _, root := range roots {
+		if !root.Writable {
+			continue
+		}
+		for _, dir := range dirs {
+			if pathUnderAny(root.Canon, []string{dir}) {
+				return protectPlan{}, fmt.Errorf("%w: writable path %q is inside protected path %q; a protected tree cannot also be granted writes", ErrUnsupportedPolicy, root.Dest, dir)
+			}
+		}
 	}
 	for _, path := range missing {
 		ancestor := nearestExistingAncestor(path)
@@ -345,9 +356,10 @@ func planProtect(paths []string, roots []protectRoot) (protectPlan, error) {
 	}
 	var plan protectPlan
 	for _, dir := range dirs {
-		if nested(dir) {
-			continue // a protected ancestor's bind already covers it
-		}
+		// Every protected directory under a writable root is bound, nested or
+		// not: an outer protected directory need not have a bind of its own
+		// (it may sit outside every writable root), so its bind cannot be
+		// assumed to cover this one.
 		bound, needed := false, false
 		for _, root := range roots {
 			if !root.Writable || !pathUnderAny(dir, []string{root.Canon}) {
@@ -360,6 +372,11 @@ func planProtect(paths []string, roots []protectRoot) (protectPlan, error) {
 			}
 			dest := filepath.Join(root.Dest, rel)
 			for ancestor := filepath.Dir(dest); ancestor != root.Dest && pathUnderAny(ancestor, []string{root.Dest}); ancestor = filepath.Dir(ancestor) {
+				// Never pin inside a protected directory: a pin is a
+				// writable bind.
+				if pathUnderAny(filepath.Join(root.Canon, mustRel(root.Dest, ancestor)), dirs) {
+					continue
+				}
 				if !slices.Contains(plan.pins, ancestor) {
 					plan.pins = append(plan.pins, ancestor)
 				}
@@ -382,6 +399,15 @@ func planProtect(paths []string, roots []protectRoot) (protectPlan, error) {
 	slices.SortFunc(plan.pins, byDepth)
 	slices.SortFunc(plan.binds, byDepth)
 	return plan, nil
+}
+
+// mustRel is filepath.Rel for a target known to be under base.
+func mustRel(base, target string) string {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return "."
+	}
+	return rel
 }
 
 func nearestExistingAncestor(path string) string {
@@ -816,6 +842,25 @@ func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string
 			addMount("--bind", item.Path, item.Path)
 		}
 	}
+
+	// Write protection right after the write mounts and before every read
+	// mount, as for legacy profiles: a pin is a writable bind, and placed
+	// first it can never re-expose a path a later read mount makes
+	// read-only. Resolved paths and roots are canonical, so each mount's
+	// Dest is its Canon.
+	var protectRoots []protectRoot
+	for _, item := range p.allWrites() {
+		protectRoots = append(protectRoots, protectRoot{Dest: item.Path, Canon: item.Path, Writable: true})
+	}
+	for _, item := range p.allReads() {
+		protectRoots = append(protectRoots, protectRoot{Dest: item.Path, Canon: item.Path})
+	}
+	plan, err := planProtect(resolvedPathStrings(p.FS.Protect), protectRoots)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, plan.pinArgs("--bind")...)
+	args = append(args, plan.bindArgs()...)
 	for _, item := range p.allReads() {
 		if alreadyMounted(item.Path) {
 			continue
@@ -832,25 +877,6 @@ func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string
 	if bridgeDir != "" && !resolvedPathVisibleInSandbox(bridgeDir, p) {
 		addMount("--ro-bind", bridgeDir, bridgeDir)
 	}
-
-	// Write protection goes over the read/write mounts above and under the
-	// deny overlays below, so Deny still wins. Resolved paths and roots are
-	// canonical, so each mount's Dest is its Canon. Deeper mounts under a
-	// writable root are not emitted (alreadyMounted), so the pins cannot
-	// cover one.
-	var protectRoots []protectRoot
-	for _, item := range p.allWrites() {
-		protectRoots = append(protectRoots, protectRoot{Dest: item.Path, Canon: item.Path, Writable: true})
-	}
-	for _, item := range p.allReads() {
-		protectRoots = append(protectRoots, protectRoot{Dest: item.Path, Canon: item.Path})
-	}
-	plan, err := planProtect(resolvedPathStrings(p.FS.Protect), protectRoots)
-	if err != nil {
-		return nil, err
-	}
-	args = append(args, plan.pinArgs("--bind")...)
-	args = append(args, plan.bindArgs()...)
 
 	// Deny precedence is implemented after broader read/write parents are mounted.
 	// ApplyResolved passes unreadable shadow sources, which supports both file and

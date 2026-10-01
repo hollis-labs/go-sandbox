@@ -49,10 +49,13 @@ func TestAccessForProtect(t *testing.T) {
 
 func TestProtectRequiresWriteProtectCapability(t *testing.T) {
 	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, "state"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	p, err := sandbox.ResolveAccessPolicy(sandbox.AccessPolicy{
 		ID:      "protect-cap",
 		Roots:   sandbox.Roots{Project: project},
-		FS:      sandbox.FilesystemAccess{Write: []sandbox.PathRef{{Root: sandbox.ProjectRoot}}, Protect: []sandbox.PathRef{{Root: sandbox.ProjectRoot, Relative: "."}}},
+		FS:      sandbox.FilesystemAccess{Write: []sandbox.PathRef{{Root: sandbox.ProjectRoot}}, Protect: []sandbox.PathRef{{Root: sandbox.ProjectRoot, Relative: "state"}}},
 		Network: sandbox.NetworkAccess{Mode: sandbox.NetworkFull},
 	})
 	if err != nil {

@@ -20,6 +20,11 @@ Write-protected control-plane paths (CW-20260930-0237).
   - `AccessFor` reports it as read-only, or no-grant when nothing covers
     it.
 - **What it accepts:**
+  - **No write grants inside.** A write grant or workspace at or inside a
+    protected directory is refused on both platforms
+    (`ResolveAccessPolicy`, `WithProtected` and the legacy builders). On
+    Linux the grant stayed writable through the protection, and an outer
+    protect even disabled an inner one's bind.
   - **Directories only.** A file entry is refused unless a protected
     directory covers it: the file's directory stays writable, so the host's
     own atomic save, or a sidecar planted beside it (SQLite's `-wal`),
@@ -27,6 +32,8 @@ Write-protected control-plane paths (CW-20260930-0237).
   - **Absolute paths only.**
   - **No re-pointable symlinks.** An entry that goes through a symlink in a
     directory the uid can write is refused: protect the real path.
+    - A directory the uid owns counts as writable even at 0555.
+    - The check follows the whole resolution, including link targets.
 - **The `write-protect` capability (`CapWriteProtect`)**, provided by linux
   bwrap and darwin seatbelt. `AssessEnforcement` requires it when a
   resolved policy protects anything.
@@ -50,10 +57,13 @@ Write-protected control-plane paths (CW-20260930-0237).
   the child sees it, over the writable mounts and under the deny overlays.
   - This applies to legacy `Apply`, `ApplyResolved` and `BuildResolvedBwrap`.
   - **Pins:** every ancestor the child could rename is first bound onto
-    itself, rw. A mount point can't be renamed or removed (EBUSY), so the
-    child can't `mv /W /W2` to carry the read-only mount away and recreate
-    `/W/state` for the host to read. Pins come before any read mount, so they
+    itself, rw, except inside a protected directory. A mount point can't be
+    renamed or removed (EBUSY), so the child can't `mv /W /W2` to carry the
+    read-only mount away and recreate `/W/state` for the host to read. Pins
+    come before any read mount in legacy and resolved mode alike, so they
     never cover a read-only grant beneath them.
+  - **Nested protected directories:** every protected directory under a
+    writable mount is bound, nested or not.
   - **Symlinked roots:** a workspace or write root reached through a symlink
     gets the bind at its symlinked path. An existing protected directory
     under a writable mount that ends up unbound fails the launch.
@@ -89,6 +99,9 @@ Write-protected control-plane paths (CW-20260930-0237).
     backlog follow-up.
 - A read-only mount doesn't stop `connect(2)` on a Unix socket. Use `Deny`
   for a control socket.
+- **Second host mounts:** protection follows the paths given. A directory
+  also reachable through a second host mount the sandbox exposes writable
+  (a bind mount, a btrfs subvolume) is not covered on that path.
 
 ## v0.4.1 — 2026-10-01
 

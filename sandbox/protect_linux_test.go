@@ -422,3 +422,151 @@ func TestApplyProtectPinsDoNotUnshadowReadOnlyGrants(t *testing.T) {
 		t.Fatalf("sandboxed script: %v\n%s", err, out)
 	}
 }
+
+// Round 3 (CW-20260930-0237): a write grant inside a protected directory
+// stayed writable on Linux, and an outer protected directory switched off an
+// inner one's bind. A protected tree cannot also be granted writes, so both
+// are refused at build.
+func TestProtectRefusesWriteGrantInsideProtectedTree(t *testing.T) {
+	base := realDir(t)
+	ctl := filepath.Join(base, "CTL")
+	w := filepath.Join(ctl, "agents", "w")
+	state := filepath.Join(w, "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := realDir(t)
+	for name, protect := range map[string][]string{
+		"write grant inside protect":    {ctl},
+		"outer and inner protect":       {ctl, state},
+		"workspace inside protect (ws)": {ws},
+	} {
+		profile := Profile{ID: "p", Net: true, Subprocess: true, FS: FSSpec{Write: []string{w}, Protect: protect}}
+		if _, err := BuildBwrapArgs(profile, ws); !errors.Is(err, ErrUnsupportedPolicy) {
+			t.Errorf("legacy %s: err = %v, want ErrUnsupportedPolicy", name, err)
+		}
+	}
+	if _, err := ResolveAccessPolicy(AccessPolicy{
+		ID: "r", Roots: Roots{Project: base},
+		FS: FilesystemAccess{Write: []PathRef{{Path: w}}, Protect: []PathRef{{Path: ctl}, {Path: state}}},
+	}); !errors.Is(err, ErrUnsupportedPolicy) {
+		t.Errorf("resolved: err = %v, want ErrUnsupportedPolicy", err)
+	}
+	base2, err := ResolveAccessPolicy(AccessPolicy{ID: "r2", Roots: Roots{Project: base}, FS: FilesystemAccess{Write: []PathRef{{Path: w}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base2.WithProtected(ctl); !errors.Is(err, ErrUnsupportedPolicy) {
+		t.Errorf("WithProtected over a write grant: err = %v, want ErrUnsupportedPolicy", err)
+	}
+	// Through a real launch: the refusal comes from Apply, and no child ever
+	// writes into the protected tree (before round 3 the write landed).
+	if _, err := exec.LookPath("bwrap"); err == nil {
+		cmd := exec.Command("/bin/sh", "-c", `echo EVIL > "$W/evil" && exit 20; exit 0`)
+		cmd.Dir = ws
+		cmd.Env = append(os.Environ(), "W="+w)
+		cleanup, err := Apply(cmd, Profile{ID: "p", Net: true, Subprocess: true, FS: FSSpec{Write: []string{w}, Protect: []string{ctl}}}, ws)
+		if err == nil {
+			defer cleanup()
+			out, _ := cmd.CombinedOutput()
+			t.Fatalf("Apply accepted a write grant inside a protected tree; the child ran: %s", out)
+		}
+		if _, statErr := os.Stat(filepath.Join(w, "evil")); statErr == nil {
+			t.Fatal("a write landed in the protected tree")
+		}
+	}
+	// The inner protect alone (the write grant is its ancestor, not inside
+	// it) is fine and binds the inner directory.
+	args, err := BuildBwrapArgs(Profile{ID: "p", FS: FSSpec{Write: []string{w}, Protect: []string{state}}}, ws)
+	if err != nil || argIndex(args, "--ro-bind", state) < 0 {
+		t.Errorf("inner protect under a write grant: %v, %v; want --ro-bind %s", args, err, state)
+	}
+}
+
+// Round 3: a directory the uid owns counts as writable for the symlink check
+// even at 0555, because its owner can chmod it back and re-point the link.
+func TestProtectRefusesSymlinkInOwnedReadOnlyDir(t *testing.T) {
+	base := realDir(t)
+	real := filepath.Join(base, "real")
+	fixed := filepath.Join(base, "fixed")
+	for _, dir := range []string{real, fixed} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(real, filepath.Join(fixed, "state")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fixed, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fixed, 0o755) })
+	if err := validateProtectPath(filepath.Join(fixed, "state")); !errors.Is(err, ErrUnsupportedPolicy) {
+		t.Fatalf("symlink in a uid-owned 0555 dir: err = %v, want ErrUnsupportedPolicy", err)
+	}
+}
+
+// Round 3: the check follows the whole resolution. A fixed symlink whose
+// target goes through a re-pointable one is refused too.
+func TestProtectRefusesSymlinkChainThroughWritableDir(t *testing.T) {
+	base := realDir(t)
+	fixedDir := filepath.Join(base, "fixed")
+	ws := filepath.Join(base, "ws")
+	real := filepath.Join(base, "real", "state")
+	for _, dir := range []string{fixedDir, ws, real} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(base, "real"), filepath.Join(ws, "link2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(ws, "link2"), filepath.Join(fixedDir, "link1")); err != nil {
+		t.Fatal(err)
+	}
+	// Mark fixedDir as one the uid could not change (as a root-owned
+	// directory would be); ws stays writable.
+	orig := protectDirWritable
+	protectDirWritable = func(dir string) bool { return dir != fixedDir && orig(dir) }
+	t.Cleanup(func() { protectDirWritable = orig })
+
+	if err := validateProtectPath(filepath.Join(fixedDir, "link1", "state")); !errors.Is(err, ErrUnsupportedPolicy) || !strings.Contains(err.Error(), "link2") {
+		t.Fatalf("chain through ws/link2: err = %v, want a refusal naming link2", err)
+	}
+	// The fixed link alone, to a real path, is accepted.
+	if err := os.Symlink(filepath.Join(base, "real"), filepath.Join(fixedDir, "direct")); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateProtectPath(filepath.Join(fixedDir, "direct", "state")); err != nil {
+		t.Fatalf("fixed link to a real path: %v", err)
+	}
+}
+
+// Round 3: in resolved mode the pins (writable binds) come before every read
+// mount, as in legacy mode, so a read grant on an ancestor of a write grant
+// cannot be undone by a pin under it.
+func TestBwrapProtectResolvedPinsBeforeReadMounts(t *testing.T) {
+	project := realDir(t)
+	w := filepath.Join(project, "w")
+	state := filepath.Join(w, "a", "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p, err := ResolveAccessPolicy(AccessPolicy{
+		ID:      "pins-before-reads",
+		Roots:   Roots{Project: project},
+		FS:      FilesystemAccess{Read: []PathRef{{Root: ProjectRoot}}, Write: []PathRef{{Path: w}}, Protect: []PathRef{{Path: state}}},
+		Network: NetworkAccess{Mode: NetworkFull},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := BuildResolvedBwrap(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, read := argIndex(args, "--bind", filepath.Join(w, "a")), argIndex(args, "--ro-bind", project)
+	if pin < 0 || read < 0 || pin > read {
+		t.Fatalf("want the pin on %s before the read mount of %s: %v", filepath.Join(w, "a"), project, args)
+	}
+}

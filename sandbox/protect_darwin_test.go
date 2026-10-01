@@ -132,4 +132,9 @@ func TestBuildSBPL_ProtectCanonicalizesAndAliases(t *testing.T) {
 	if _, err := BuildSBPL(Profile{ID: "p", FS: FSSpec{Protect: []string{"relative/state"}}}, "/Users/test/ws"); err == nil {
 		t.Error("BuildSBPL accepted a relative protected path")
 	}
+	// A write grant inside a protected tree is refused, as on Linux, so the
+	// platforms cannot disagree about it.
+	if _, err := BuildSBPL(Profile{ID: "p", FS: FSSpec{Write: []string{real + "/w"}, Protect: []string{dir}}}, "/Users/test/ws"); err == nil {
+		t.Error("BuildSBPL accepted a write grant inside a protected path")
+	}
 }

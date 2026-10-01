@@ -299,6 +299,9 @@ func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
 	if err := validateProtectSet(resolvedPathStrings(resolved.FS.Protect)); err != nil {
 		return ResolvedAccessPolicy{}, err
 	}
+	if err := validateWritesOutsideProtect(resolvedPathStrings(resolved.allWrites()), resolvedPathStrings(resolved.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
 
 	if p.Runtime.Executable != (PathRef{}) {
 		exe, err := resolvePathRef(AccessRuntimeRead, p.Runtime.Executable, roots)
@@ -380,6 +383,9 @@ func (p ResolvedAccessPolicy) WithProtected(paths ...string) (ResolvedAccessPoli
 		}
 	}
 	if err := validateProtectSet(resolvedPathStrings(out.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
+	if err := validateWritesOutsideProtect(resolvedPathStrings(out.allWrites()), resolvedPathStrings(out.FS.Protect)); err != nil {
 		return ResolvedAccessPolicy{}, err
 	}
 	sortResolvedPolicy(&out)
@@ -718,13 +724,41 @@ func resolvePathRef(kind AccessKind, ref PathRef, roots ResolvedRoots) (Resolved
 // host would follow it somewhere writable. Symlinks in directories the uid
 // cannot write (/var -> /private/var on macOS) are fixed and allowed. A
 // host passes the real path instead.
+//
+// It follows the whole resolution, not just the path as written: a fixed
+// symlink whose target goes through a re-pointable one is refused too.
 func validateProtectPath(path string) error {
 	path = filepath.Clean(path)
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("sandbox: protected path %q must be absolute", path)
 	}
-	prefix := string(filepath.Separator)
-	for _, part := range strings.Split(strings.TrimPrefix(path, prefix), string(filepath.Separator)) {
+	walk := path
+	for hops := 0; ; hops++ {
+		if hops > maxPolicySymlinkFollow {
+			return fmt.Errorf("sandbox: too many symlinks resolving protected path %q", path)
+		}
+		next, err := protectWalkStep(path, walk)
+		if err != nil || next == "" {
+			return err
+		}
+		walk = next
+	}
+}
+
+// protectDirWritable is uidCanWrite, a variable so a test can mark a
+// directory fixed: a non-root test cannot make one the uid neither owns nor
+// can write.
+var protectDirWritable = uidCanWrite
+
+// protectWalkStep walks walk component by component until the first
+// symlink. It refuses that symlink if the uid can write its directory, and
+// otherwise returns the path with the link replaced by its target, to walk
+// again. It returns "" once walk has no symlink left (or stops existing).
+func protectWalkStep(path, walk string) (string, error) {
+	sep := string(filepath.Separator)
+	parts := strings.Split(strings.TrimPrefix(walk, sep), sep)
+	prefix := sep
+	for i, part := range parts {
 		if part == "" {
 			continue
 		}
@@ -733,15 +767,26 @@ func validateProtectPath(path string) error {
 		info, err := os.Lstat(prefix)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil
+				return "", nil
 			}
-			return fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+			return "", fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
 		}
-		if info.Mode()&os.ModeSymlink != 0 && uidCanWrite(parent) {
-			return fmt.Errorf("%w: protected path %q goes through symlink %q in writable directory %q, which the sandboxed process could re-point; protect the real path", ErrUnsupportedPolicy, path, prefix, parent)
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
 		}
+		if protectDirWritable(parent) {
+			return "", fmt.Errorf("%w: protected path %q goes through symlink %q in writable directory %q, which the sandboxed process could re-point; protect the real path", ErrUnsupportedPolicy, path, prefix, parent)
+		}
+		target, err := os.Readlink(prefix)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(parent, target)
+		}
+		return filepath.Join(append([]string{target}, parts[i+1:]...)...), nil
 	}
-	return nil
+	return "", nil
 }
 
 // validateProtectSet refuses protected paths that are not directories (unless
@@ -779,6 +824,23 @@ func validateProtectSet(paths []string) error {
 			continue
 		}
 		return fmt.Errorf("%w: protected path %q is not a directory; protect its directory (a file's directory stays writable, so an atomic save or a database sidecar beside it defeats file-level protection)", ErrUnsupportedPolicy, e.path)
+	}
+	return nil
+}
+
+// validateWritesOutsideProtect refuses a write grant (or workspace) at or
+// inside a protected directory. Protect wins over write on macOS, where the
+// write deny follows the allow, but on Linux a writable mount inside a
+// protected directory would stay writable, so the platforms would disagree;
+// the policy is refused instead of guessing which the host meant. writes and
+// protected are canonical.
+func validateWritesOutsideProtect(writes, protected []string) error {
+	for _, write := range writes {
+		for _, dir := range protected {
+			if pathContains(dir, write) {
+				return fmt.Errorf("%w: write grant %q is inside protected path %q; a protected tree cannot also be granted writes", ErrUnsupportedPolicy, write, dir)
+			}
+		}
 	}
 	return nil
 }
