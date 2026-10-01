@@ -92,7 +92,7 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
   - It shares the ipc and uts namespaces and the session, so a PTY keeps its terminal.
   - It refuses `FS.Deny`.
   - macOS legacy profiles are already default-allow.
-  - **It stops direct writes, not delegated ones.** The host filesystem includes the user's runtime sockets (`$XDG_RUNTIME_DIR`: the D-Bus session bus and the systemd user manager), terminal-multiplexer sockets, and the host apps' own APIs. Any same-uid service reachable through them can write a protected path on the agent's behalf, for example `systemd-run --user`. A narrowed or resolved policy that doesn't mount those sockets is the boundary.
+  - **Boundary:** Protect stops direct writes in every mode. Against writes delegated to another process (for example `systemd-run --user` over `$XDG_RUNTIME_DIR/bus` or `$XDG_RUNTIME_DIR/systemd/private`), it holds only under a narrowed or resolved policy that doesn't mount those sockets. HostFilesystem mode is not a boundary against delegation. The host filesystem includes the user's runtime sockets (the D-Bus session bus and the systemd user manager), terminal-multiplexer sockets, and the host apps' own APIs, and any same-uid service behind them can write for the agent. Hiding `$XDG_RUNTIME_DIR` wholesale would break ssh-agent and the keyring, which uses the session bus, so it is not hidden.
 - **Limits:**
   - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead.
   - A path the app reaches through a symlink in an agent-writable directory can be re-pointed, so protect the real path the app opens.

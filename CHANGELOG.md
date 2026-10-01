@@ -57,12 +57,17 @@ Write-protected control-plane paths (CW-20260930-0237).
 
 ### Not covered
 
-- **`HostFilesystem` stops direct writes, not delegated ones.** The child
-  can still reach the user's runtime sockets (the D-Bus session bus and the
-  systemd user manager under `$XDG_RUNTIME_DIR`), terminal-multiplexer
-  sockets, and the host apps' own APIs. Any same-uid service behind them can
-  write a protected path for it. A narrowed or resolved policy without those
-  sockets is the boundary.
+- **Boundary:** Protect stops direct writes in every mode. Against writes
+  delegated to another process (for example `systemd-run --user` over
+  `$XDG_RUNTIME_DIR/bus` or `$XDG_RUNTIME_DIR/systemd/private`), it holds
+  only under a narrowed or resolved policy that doesn't mount those sockets.
+  HostFilesystem mode is not a boundary against delegation.
+  - The child there can reach the user's runtime sockets,
+    terminal-multiplexer sockets and the host apps' own APIs.
+  - `$XDG_RUNTIME_DIR` is not hidden wholesale: that would break ssh-agent
+    and the keyring, which uses the session bus.
+  - An opt-in to hide the systemd user-manager sockets is a backlog
+    follow-up.
 
 - A read-only mount does not stop `connect(2)` on a Unix socket. Use `Deny`
   for a control socket.
