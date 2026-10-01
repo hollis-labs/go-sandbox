@@ -18,7 +18,11 @@ binary, or manage network egress (that is `go-egress-proxy`).
   honest no-backend paths.
 - `sandbox/profile.go` is the legacy `Profile` / `Apply` API kept for
   compatibility.
-- `internal/pathsafe/pathsafe.go` owns path-escape rejection.
+- Path-escape rejection is `github.com/hollis-labs/go-safefs/pathsafe`
+  (`ResolveUnder`, used by `resolvePathRef` in `sandbox/policy.go`).
+  `canonicalPath` in the same file resolves roots, absolute refs and
+  `AccessFor` queries with its own resolver; both follow a dangling symlink
+  to its target (`sandbox/dangling_symlink_test.go`).
 
 ## Commands
 
