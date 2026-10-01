@@ -3,6 +3,24 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.1 — 2026-10-01
+
+### Fixed
+
+- **A host-filesystem profile runs the command at the path the caller gave**
+  (CW-20260930-0237).
+  - On Linux, `Apply` with `Profile.HostFilesystem` still ran the narrowed
+    profile's payload logic. For a command that is a symlink to a target
+    outside the workspace and system dirs (an installed CLI shim,
+    `~/.local/bin/<tool>`), it judged the target "not visible", bound it
+    and executed the resolved target instead.
+  - That changed `argv[0]`, so a multi-call binary, or a launcher that
+    dispatches on its own name, did something else entirely.
+  - A host-filesystem profile binds `/` itself, so everything is visible at
+    its own path, and the command now runs unchanged.
+- Pinned by `TestApplyHostFilesystemKeepsSymlinkedCommandPath`, which fails
+  on v0.5.0.
+
 ## v0.5.0 — 2026-10-01
 
 Write-protected control-plane paths (CW-20260930-0237).
