@@ -57,11 +57,19 @@ type PathRef struct {
 // FilesystemAccess is the child process filesystem policy. Deny rules always
 // take precedence over read and write grants. SourceRead entries are resolved
 // and recorded for provenance, but are not child execution grants.
+//
+// Protect lists paths the child must never write, even inside a Write grant:
+// control-plane state such as a host's database, config or allow-lists, which
+// a same-uid agent could otherwise rewrite to grant itself authority
+// (CW-20260930-0237). Protection is narrower than Deny (the child may still
+// read a protected path that a grant covers) and grants nothing: a protected
+// path outside every grant stays invisible. Deny overrides Protect.
 type FilesystemAccess struct {
 	Read       []PathRef
 	Write      []PathRef
 	Deny       []PathRef
 	SourceRead []PathRef
+	Protect    []PathRef
 }
 
 // RuntimeAccess declares host runtime files the backend must make readable,
@@ -165,6 +173,7 @@ const (
 	AccessDeny        AccessKind = "deny"
 	AccessSourceRead  AccessKind = "source-read"
 	AccessRuntimeRead AccessKind = "runtime-read"
+	AccessProtect     AccessKind = "protect"
 )
 
 // ResolvedPath is a normalized access rule.
@@ -176,12 +185,15 @@ type ResolvedPath struct {
 }
 
 // ResolvedFilesystemAccess is the concrete filesystem policy. Write grants
-// imply read access. Deny grants override both read and write.
+// imply read access. Deny grants override both read and write. Protect
+// overrides write: a protected path is at most read-only (see
+// FilesystemAccess.Protect).
 type ResolvedFilesystemAccess struct {
 	Read       []ResolvedPath
 	Write      []ResolvedPath
 	Deny       []ResolvedPath
 	SourceRead []ResolvedPath
+	Protect    []ResolvedPath
 }
 
 // ResolvedAccessPolicy is the normalized sandbox request consumed by backend
@@ -281,6 +293,9 @@ func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
 	if resolved.FS.SourceRead, err = resolvePathRefs(AccessSourceRead, p.FS.SourceRead, roots); err != nil {
 		return ResolvedAccessPolicy{}, err
 	}
+	if resolved.FS.Protect, err = resolvePathRefs(AccessProtect, p.FS.Protect, roots); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
 
 	if p.Runtime.Executable != (PathRef{}) {
 		exe, err := resolvePathRef(AccessRuntimeRead, p.Runtime.Executable, roots)
@@ -327,6 +342,12 @@ func (p ResolvedAccessPolicy) AccessFor(path string) AccessDecision {
 	if containsPath(p.allDenies(), resolved) {
 		return AccessDenied
 	}
+	if containsPath(p.FS.Protect, resolved) {
+		if containsPath(p.allWrites(), resolved) || containsPath(p.allReads(), resolved) {
+			return AccessReadOnly
+		}
+		return AccessNoGrant
+	}
 	if containsPath(p.allWrites(), resolved) {
 		return AccessReadWrite
 	}
@@ -334,6 +355,29 @@ func (p ResolvedAccessPolicy) AccessFor(path string) AccessDecision {
 		return AccessReadOnly
 	}
 	return AccessNoGrant
+}
+
+// WithProtected returns a copy of p that also write-protects paths (see
+// FilesystemAccess.Protect). Each path must be absolute; it is canonicalized
+// the way ResolveAccessPolicy canonicalizes absolute refs. It is how a host
+// adds its control-plane paths to a policy that was resolved elsewhere.
+func (p ResolvedAccessPolicy) WithProtected(paths ...string) (ResolvedAccessPolicy, error) {
+	out := p
+	out.FS.Protect = slices.Clone(p.FS.Protect)
+	for _, raw := range paths {
+		if !filepath.IsAbs(raw) {
+			return ResolvedAccessPolicy{}, fmt.Errorf("sandbox: protected path %q must be absolute", raw)
+		}
+		resolved, err := resolvePathRef(AccessProtect, PathRef{Path: raw}, ResolvedRoots{})
+		if err != nil {
+			return ResolvedAccessPolicy{}, err
+		}
+		if !slices.ContainsFunc(out.FS.Protect, func(r ResolvedPath) bool { return r.Path == resolved.Path }) {
+			out.FS.Protect = append(out.FS.Protect, resolved)
+		}
+	}
+	sortResolvedPolicy(&out)
+	return out, nil
 }
 
 // LegacyProfile converts a resolved policy into the legacy Profile shape. This
@@ -359,6 +403,9 @@ func (p ResolvedAccessPolicy) LegacyProfile() Profile {
 	for _, item := range p.allDenies() {
 		profile.FS.Deny = append(profile.FS.Deny, item.Path)
 	}
+	for _, item := range p.FS.Protect {
+		profile.FS.Protect = append(profile.FS.Protect, item.Path)
+	}
 	return profile
 }
 
@@ -380,9 +427,10 @@ func PolicyFromProfile(p Profile, workspace string) AccessPolicy {
 		Backend: BackendAuto,
 		Roots:   roots,
 		FS: FilesystemAccess{
-			Read:  pathRefsFromLegacy(p.FS.Read),
-			Write: pathRefsFromLegacy(p.FS.Write),
-			Deny:  pathRefsFromLegacy(p.FS.Deny),
+			Read:    pathRefsFromLegacy(p.FS.Read),
+			Write:   pathRefsFromLegacy(p.FS.Write),
+			Deny:    pathRefsFromLegacy(p.FS.Deny),
+			Protect: pathRefsFromLegacy(p.FS.Protect),
 		},
 		Network: NetworkAccess{
 			Mode:          legacyNetworkMode(p),
@@ -412,6 +460,7 @@ const (
 	CapLoopbackForward     Capability = "loopback-forward"
 	CapSubprocessDeny      Capability = "subprocess-deny"
 	CapGUILaunchDeny       Capability = "gui-launch-deny"
+	CapWriteProtect        Capability = "write-protect"
 	CapDisabledMode        Capability = "disabled-mode"
 )
 
@@ -456,6 +505,7 @@ func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapab
 			CapNetworkDeny,
 			CapLoopback,
 			CapGUILaunchDeny,
+			CapWriteProtect,
 		}
 	case BackendLinuxBwrap:
 		caps.Supported = goos == "linux"
@@ -468,6 +518,7 @@ func ResolveBackendCapabilities(goos string, requested BackendName) BackendCapab
 			CapNetworkDeny,
 			CapLoopback,
 			CapLoopbackForward,
+			CapWriteProtect,
 		}
 	default:
 		caps.Supported = false
@@ -807,6 +858,7 @@ func sortResolvedPolicy(p *ResolvedAccessPolicy) {
 	sortPaths(p.FS.Write)
 	sortPaths(p.FS.Deny)
 	sortPaths(p.FS.SourceRead)
+	sortPaths(p.FS.Protect)
 	sortPaths(p.Runtime)
 	sortPaths(p.ProviderState.Read)
 	sortPaths(p.ProviderState.Write)
@@ -840,6 +892,9 @@ func requiredCapabilities(p ResolvedAccessPolicy) []Capability {
 	}
 	if len(p.FS.Deny) > 0 {
 		add(CapDenyPrecedence)
+	}
+	if len(p.FS.Protect) > 0 {
+		add(CapWriteProtect)
 	}
 	if len(p.Runtime) > 0 {
 		add(CapRuntimeReads)

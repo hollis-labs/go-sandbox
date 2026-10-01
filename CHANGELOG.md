@@ -3,6 +3,56 @@
 All notable changes to this project will be documented in this file. This
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.0 — 2026-10-01
+
+Write-protected control-plane paths (CW-20260930-0237).
+
+### Added
+
+- **`FS.Protect`** on `FilesystemAccess`, `ResolvedFilesystemAccess` (with
+  the `AccessProtect` kind) and the legacy `Profile.FS` (yaml `protect`).
+  - It lists paths the child must never write, even inside a write grant:
+    a host's database, config, catalog or allow-lists. An agent running as
+    the operator's uid could otherwise rewrite them to grant itself
+    authority.
+  - It stays readable where a grant covers it, and grants nothing. `Deny`
+    still overrides it.
+  - `AccessFor` reports a protected path as read-only, or no-grant when
+    nothing covers it.
+- **The `write-protect` capability (`CapWriteProtect`)**, provided by linux
+  bwrap and darwin seatbelt. `AssessEnforcement` requires it when a
+  resolved policy protects anything.
+- **`ResolvedAccessPolicy.WithProtected(paths...)`** adds absolute paths to
+  an already-resolved policy, canonicalized and deduplicated. This is how a
+  host composes its control-plane paths into a policy built elsewhere.
+- **`Profile.HostFilesystem`** (yaml `host_filesystem`) is the minimal
+  protect-only sandbox for hosts whose agents otherwise run unconfined.
+  - On Linux it binds the host filesystem writable with devices
+    (`--dev-bind / /`). It shares the pid, ipc and uts namespaces and the
+    session, so a PTY keeps its terminal, and it unshares the network only
+    when `Net` is false.
+  - It refuses `FS.Deny` rather than ignore it.
+  - macOS legacy profiles are already default-allow, so it changes nothing
+    there.
+- **Linux enforcement.** Each protected path that exists and is visible is
+  read-only-bound over the writable mounts and under the deny overlays.
+  - This applies to legacy `Apply`, `ApplyResolved` and `BuildResolvedBwrap`.
+  - Writes, creates, renames, unlinks and mkdir inside it fail with EROFS,
+    pinned by tests that run real bwrap.
+  - A protected path that does not exist is refused where the child could
+    create it, and skipped elsewhere.
+- **macOS enforcement.** `BuildSBPL` and `BuildResolvedSBPL` emit
+  `(deny file-write* …)` for each protected path after every write allow.
+  These were checked by reasoning and by darwin-only tests compiled with
+  `GOOS=darwin`; they have not run on a Mac.
+
+### Not covered
+
+- A read-only mount does not stop `connect(2)` on a Unix socket. Use `Deny`
+  for a control socket.
+- A path reached through a symlink in an agent-writable directory can be
+  re-pointed. Protect the real path.
+
 ## v0.4.1 — 2026-10-01
 
 Security fix (CW-20261001-0057).

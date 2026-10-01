@@ -129,6 +129,19 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 		b.WriteString("\n")
 	}
 
+	// Write-protected paths: after every write allow, so they win.
+	protected := make([]string, 0, len(p.FS.Protect))
+	for i, raw := range p.FS.Protect {
+		path, err := expandAndValidate(fmt.Sprintf("FS.Protect[%d]", i), raw, absWS)
+		if err != nil {
+			return "", err
+		}
+		protected = append(protected, path)
+	}
+	if err := writeProtectDenies(&b, protected); err != nil {
+		return "", err
+	}
+
 	if !p.Net {
 		if p.AllowLoopback {
 			if err := writeLoopbackAllows(&b); err != nil {
@@ -185,6 +198,9 @@ func BuildResolvedSBPL(p ResolvedAccessPolicy) (string, error) {
 		return "", err
 	}
 	if err := writeResolvedDenies(&b, resolvedPathStrings(p.allDenies())); err != nil {
+		return "", err
+	}
+	if err := writeProtectDenies(&b, resolvedPathStrings(p.FS.Protect)); err != nil {
 		return "", err
 	}
 
@@ -306,6 +322,25 @@ func writeResolvedDenies(b *strings.Builder, paths []string) error {
 		if err := writeSeatbeltPathRule(b, "deny", "file-read*", path); err != nil {
 			return err
 		}
+		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
+			return err
+		}
+	}
+	b.WriteString("\n")
+	return nil
+}
+
+// writeProtectDenies emits the write denies for write-protected paths
+// (FilesystemAccess.Protect, Profile.FS.Protect). They must follow every
+// write allow so they take precedence; they leave reads to the rules above.
+// Seatbelt matches by path, so a protected path that does not exist yet is
+// protected too, unlike Linux bwrap.
+func writeProtectDenies(b *strings.Builder, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	b.WriteString("; Write-protected paths: never writable, whatever allows them above.\n")
+	for _, path := range paths {
 		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
 			return err
 		}

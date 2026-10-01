@@ -74,6 +74,21 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
 
 `DenyGUILaunch` (on `AccessPolicy`, `ResolvedAccessPolicy` and the legacy `Profile`) stops the child from launching GUI applications, such as a CLI whose sign-in fallback opens a browser. On macOS both emitters deny `exec` of `/usr/bin/open` and Mach lookups of LaunchServices (`launchservicesd`, `lsd.*`), so a copy of `open` or any other LaunchServices client is cut off too. It is reported as the `gui-launch-deny` capability: macOS seatbelt provides it, Linux bwrap does not, and a required resolved policy that asks for it on Linux is refused rather than run unenforced. It is macOS-only and a no-op for legacy `Apply` on Linux, like `Subprocess`. Note that a resolved policy is default-deny, so one that sets only `DenyGUILaunch` would also deny everything else; to deny GUI launch and nothing more, use a legacy default-allow `Profile{Net: true, Subprocess: true, DenyGUILaunch: true}` (what agentkit does).
 
+`FS.Protect` (on `AccessPolicy`, `ResolvedAccessPolicy` and the legacy `Profile`, yaml `protect`) write-protects control-plane state: a host's database, config, catalog or allow-lists, which an agent running as the operator's uid could otherwise rewrite to grant itself authority.
+- **Semantics:**
+  - A protected path is never writable, even inside a write grant or the workspace.
+  - It stays readable where a grant covers it, and protection grants nothing: a protected path outside every grant stays invisible.
+  - `Deny` still wins over it.
+  - `ResolvedAccessPolicy.WithProtected(paths...)` adds absolute paths to a policy resolved elsewhere.
+  - It is reported as the `write-protect` capability, which both backends provide.
+- **Linux:** bwrap read-only-binds each protected path over the writable mounts, so writes, creates, renames and unlinks inside it fail.
+  - A protected path that does not exist cannot be bound without creating it on the host. Where the child could create it, it is refused at launch; create it first or protect its existing parent. Elsewhere it is skipped.
+- **macOS:** seatbelt denies `file-write*` on it, by path, after every allow.
+- **No sandbox today:** for a host whose agents run unconfined and only need this protection, `Profile{HostFilesystem: true, Net: true, Subprocess: true, FS: FSSpec{Protect: …}}` is the minimal sandbox. On Linux it binds the host filesystem writable with devices (`--dev-bind / /`) and shares the pid, ipc and uts namespaces and the session, so it changes nothing but protection. It refuses `FS.Deny`. macOS legacy profiles are already default-allow.
+- **Limits:**
+  - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead.
+  - A path the app reaches through a symlink in an agent-writable directory can be re-pointed, so protect the real path the app opens.
+
 Existing callers can continue using `Profile` directly:
 
 ```go

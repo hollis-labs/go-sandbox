@@ -20,6 +20,13 @@ type FSSpec struct {
 	// Deny lists paths explicitly blocked even if covered by a Read allow.
 	// Deny entries take precedence over Read allows.
 	Deny []string `yaml:"deny"`
+	// Protect lists paths the session must never write, even inside the
+	// workspace or a Write path: control-plane state such as a host's
+	// database, config or allow-lists (CW-20260930-0237). A protected path
+	// stays readable where a grant covers it, and protection grants nothing.
+	// Linux protects paths that exist at Apply time and refuses one that does
+	// not exist where the session could create it; macOS protects by path.
+	Protect []string `yaml:"protect"`
 }
 
 // Profile is a named sandbox configuration. Profiles are typically loaded
@@ -49,6 +56,17 @@ type Profile struct {
 	// LaunchServices); Linux bwrap does not enforce it, and a resolved policy
 	// that requires it is refused there (see CapGUILaunchDeny).
 	DenyGUILaunch bool `yaml:"deny_gui_launch"`
+	// HostFilesystem gives the session the host filesystem as the parent sees
+	// it, writable, instead of Linux bwrap's narrowed system mounts; only
+	// FS.Protect narrows it. It is the minimal sandbox for a host whose agents
+	// otherwise run unconfined and only need control-plane protection. On
+	// Linux it binds / (with devices), leaves the pid, ipc and uts namespaces
+	// and the session (so a PTY keeps its controlling terminal) shared, and
+	// unshares the network only when Net is false. FS.Read and FS.Write add
+	// nothing in this mode, and Linux refuses FS.Deny in it rather than
+	// ignore it. macOS legacy profiles are already default-allow, so it
+	// changes nothing there.
+	HostFilesystem bool `yaml:"host_filesystem"`
 }
 
 // LoadProfile reads and parses a single profile YAML file.
