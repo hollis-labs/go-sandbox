@@ -148,6 +148,7 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 		expandAll(p.FS.Protect, absWS, home),
 		func(path string) bool { return pathVisibleInSandbox(path, absWS, p) },
 		func(path string) bool { return pathUnderAny(path, writable) },
+		"--bind",
 	)
 	if err != nil {
 		return nil, err
@@ -179,19 +180,25 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 
 // buildHostFilesystemBwrapArgs is Profile.HostFilesystem: the host
 // filesystem as the parent sees it, writable and with devices, minus the
-// write-protected paths. It shares the pid, ipc and uts namespaces and the
-// session, so it changes nothing for the child but protection (and, when Net
-// is false, the network).
+// write-protected paths. It shares the ipc and uts namespaces and the
+// session, so apart from protection the child sees only its own processes in
+// /proc and, when Net is false, no network.
 func buildHostFilesystemBwrapArgs(p Profile, workspace string) ([]string, error) {
 	if len(p.FS.Deny) > 0 {
 		return nil, fmt.Errorf("%w: profile %q: FS.Deny is not enforced by a host-filesystem profile on linux", ErrUnsupportedPolicy, p.ID)
 	}
 	home, _ := os.UserHomeDir()
-	args := []string{"--dev-bind", "/", "/"}
+	// A private pid namespace and /proc: the host's /proc would offer
+	// /proc/<pid>/root of every same-uid host process, a path into the host
+	// mount namespace that no bind here covers. The user namespace already
+	// refuses that traversal; this keeps it refused under a setuid bwrap,
+	// which does not create one.
+	args := []string{"--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc"}
 	protect, err := bwrapProtectBinds(
 		expandAll(p.FS.Protect, workspace, home),
 		func(string) bool { return true },
 		func(string) bool { return true },
+		"--dev-bind",
 	)
 	if err != nil {
 		return nil, err
@@ -204,15 +211,23 @@ func buildHostFilesystemBwrapArgs(p Profile, workspace string) ([]string, error)
 	return args, nil
 }
 
-// bwrapProtectBinds returns the read-only binds that write-protect paths
-// (FilesystemAccess.Protect, Profile.FS.Protect). Each must follow the mounts
-// that make it visible. A path that exists and is visible gets --ro-bind over
-// itself; one that is not visible stays hidden, since protection grants
-// nothing. A path that does not exist cannot be bound without creating it on
-// the host, so it is refused when the child could create it (its nearest
-// existing ancestor is writable and not itself protected), and skipped
-// otherwise.
-func bwrapProtectBinds(paths []string, visible, writable func(string) bool) ([]string, error) {
+// bwrapProtectBinds returns the binds that write-protect paths
+// (FilesystemAccess.Protect, Profile.FS.Protect). They must follow the mounts
+// that make the paths visible.
+//
+//   - A path that exists and is visible gets --ro-bind over itself. One that
+//     is not visible stays hidden, since protection grants nothing.
+//   - Every ancestor the child could rename (its parent is writable) is first
+//     bound onto itself with pinFlag, rw as before. A mount point cannot be
+//     renamed or removed (EBUSY), so the child cannot move the protected
+//     tree aside, for example `mv /W /W2`, which carries the read-only mount
+//     with it, and recreate /W/state with its own content for the host to
+//     read.
+//   - A path that does not exist cannot be bound without creating it on the
+//     host, so it is refused when the child could create it (its nearest
+//     existing ancestor is writable and not itself protected), and skipped
+//     otherwise.
+func bwrapProtectBinds(paths []string, visible, writable func(string) bool, pinFlag string) ([]string, error) {
 	var existing, missing []string
 	for _, raw := range paths {
 		path := filepath.Clean(raw)
@@ -243,14 +258,32 @@ func bwrapProtectBinds(paths []string, visible, writable func(string) bool) ([]s
 		}
 		return strings.Compare(a, b)
 	})
-	var args []string
+	var pins, binds []string
 	for _, path := range existing {
 		if !visible(path) {
 			continue
 		}
-		args = append(args, "--ro-bind", path, path)
+		for _, ancestor := range parentDirsForBwrap(path) {
+			if slices.Contains(pins, ancestor) || slices.Contains(existing, ancestor) || pathUnderAny(ancestor, existing) {
+				continue
+			}
+			if visible(ancestor) && writable(filepath.Dir(ancestor)) {
+				pins = append(pins, ancestor)
+			}
+		}
+		binds = append(binds, "--ro-bind", path, path)
 	}
-	return args, nil
+	slices.SortFunc(pins, func(a, b string) int {
+		if da, db := pathDepthLinux(a), pathDepthLinux(b); da != db {
+			return da - db
+		}
+		return strings.Compare(a, b)
+	})
+	args := make([]string, 0, 3*len(pins)+len(binds))
+	for _, pin := range pins {
+		args = append(args, pinFlag, pin, pin)
+	}
+	return append(args, binds...), nil
 }
 
 func nearestExistingAncestor(path string) string {
@@ -712,7 +745,7 @@ func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string
 
 	// Write protection goes over the read/write mounts above and under the
 	// deny overlays below, so Deny still wins.
-	protect, err := bwrapProtectBinds(resolvedPathStringsLinux(p.FS.Protect), alreadyMounted, alreadyWritable)
+	protect, err := bwrapProtectBinds(resolvedPathStringsLinux(p.FS.Protect), alreadyMounted, alreadyWritable, "--bind")
 	if err != nil {
 		return nil, err
 	}

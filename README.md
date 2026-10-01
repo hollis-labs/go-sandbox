@@ -82,9 +82,17 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
   - `ResolvedAccessPolicy.WithProtected(paths...)` adds absolute paths to a policy resolved elsewhere.
   - It is reported as the `write-protect` capability, which both backends provide.
 - **Linux:** bwrap read-only-binds each protected path over the writable mounts, so writes, creates, renames and unlinks inside it fail.
+  - Every ancestor the child could rename is first bound onto itself, rw as before. A mount point can't be renamed or removed, so the child can't `mv` the protected tree aside and recreate it with its own content.
   - A protected path that does not exist cannot be bound without creating it on the host. Where the child could create it, it is refused at launch; create it first or protect its existing parent. Elsewhere it is skipped.
 - **macOS:** seatbelt denies `file-write*` on it, by path, after every allow.
-- **No sandbox today:** for a host whose agents run unconfined and only need this protection, `Profile{HostFilesystem: true, Net: true, Subprocess: true, FS: FSSpec{Protect: …}}` is the minimal sandbox. On Linux it binds the host filesystem writable with devices (`--dev-bind / /`) and shares the pid, ipc and uts namespaces and the session, so it changes nothing but protection. It refuses `FS.Deny`. macOS legacy profiles are already default-allow.
+  - Each ancestor is also denied writes by literal: the entry, not its contents. That stops an ancestor being renamed away and replaced with a symlink to a writable dir.
+- **No sandbox today:** for a host whose agents run unconfined and only need this protection, `Profile{HostFilesystem: true, Net: true, Subprocess: true, FS: FSSpec{Protect: …}}` is the minimal sandbox.
+  - On Linux it binds the host filesystem writable with devices (`--dev-bind / /`).
+  - It gives the child its own pid namespace and `/proc`, so no host process's `/proc/<pid>/root` leads around the binds.
+  - It shares the ipc and uts namespaces and the session, so a PTY keeps its terminal.
+  - It refuses `FS.Deny`.
+  - macOS legacy profiles are already default-allow.
+  - **It stops direct writes, not delegated ones.** The host filesystem includes the user's runtime sockets (`$XDG_RUNTIME_DIR`: the D-Bus session bus and the systemd user manager), terminal-multiplexer sockets, and the host apps' own APIs. Any same-uid service reachable through them can write a protected path on the agent's behalf, for example `systemd-run --user`. A narrowed or resolved policy that doesn't mount those sockets is the boundary.
 - **Limits:**
   - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead.
   - A path the app reaches through a symlink in an agent-writable directory can be re-pointed, so protect the real path the app opens.

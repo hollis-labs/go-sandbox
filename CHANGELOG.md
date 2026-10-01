@@ -28,14 +28,20 @@ Write-protected control-plane paths (CW-20260930-0237).
 - **`Profile.HostFilesystem`** (yaml `host_filesystem`) is the minimal
   protect-only sandbox for hosts whose agents otherwise run unconfined.
   - On Linux it binds the host filesystem writable with devices
-    (`--dev-bind / /`). It shares the pid, ipc and uts namespaces and the
-    session, so a PTY keeps its terminal, and it unshares the network only
-    when `Net` is false.
+    (`--dev-bind / /`).
+  - It gives the child a private pid namespace and `/proc`, so no host
+    process's `/proc/<pid>/root` leads around the binds.
+  - It shares the ipc and uts namespaces and the session, so a PTY keeps its
+    terminal, and it unshares the network only when `Net` is false.
   - It refuses `FS.Deny` rather than ignore it.
   - macOS legacy profiles are already default-allow, so it changes nothing
     there.
 - **Linux enforcement.** Each protected path that exists and is visible is
   read-only-bound over the writable mounts and under the deny overlays.
+  - Every ancestor the child could rename is first bound onto itself, rw.
+    A mount point can't be renamed or removed (EBUSY), so `mv /W /W2`
+    can't carry the read-only mount away and let the child recreate
+    `/W/state` for the host to read. Before the pins, that attack worked.
   - This applies to legacy `Apply`, `ApplyResolved` and `BuildResolvedBwrap`.
   - Writes, creates, renames, unlinks and mkdir inside it fail with EROFS,
     pinned by tests that run real bwrap.
@@ -43,10 +49,20 @@ Write-protected control-plane paths (CW-20260930-0237).
     create it, and skipped elsewhere.
 - **macOS enforcement.** `BuildSBPL` and `BuildResolvedSBPL` emit
   `(deny file-write* …)` for each protected path after every write allow.
+  - Each ancestor also gets a literal write deny (the entry, not its
+    contents), so an ancestor can't be renamed away and replaced with a
+    symlink to a writable dir.
   These were checked by reasoning and by darwin-only tests compiled with
   `GOOS=darwin`; they have not run on a Mac.
 
 ### Not covered
+
+- **`HostFilesystem` stops direct writes, not delegated ones.** The child
+  can still reach the user's runtime sockets (the D-Bus session bus and the
+  systemd user manager under `$XDG_RUNTIME_DIR`), terminal-multiplexer
+  sockets, and the host apps' own APIs. Any same-uid service behind them can
+  write a protected path for it. A narrowed or resolved policy without those
+  sockets is the boundary.
 
 - A read-only mount does not stop `connect(2)` on a Unix socket. Use `Deny`
   for a control socket.

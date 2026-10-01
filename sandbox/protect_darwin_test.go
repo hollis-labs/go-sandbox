@@ -29,6 +29,16 @@ func TestBuildSBPL_ProtectDeniesWritesAfterAllows(t *testing.T) {
 	if strings.Contains(sbpl, `(deny file-read* (subpath "/Users/test/ws/.state"))`) {
 		t.Errorf("protection must not deny reads:\n%s", sbpl)
 	}
+	// Ancestors are pinned by literal (the entry, not its contents), so the
+	// child cannot rename one away and symlink its own dir in its place.
+	for _, ancestor := range []string{"/Users/test/ws", "/Users/test", "/Users"} {
+		if !strings.Contains(sbpl, `(deny file-write* (literal "`+ancestor+`"))`) {
+			t.Errorf("missing literal write deny for ancestor %s:\n%s", ancestor, sbpl)
+		}
+		if strings.Contains(sbpl, `(deny file-write* (subpath "`+ancestor+`"))`) {
+			t.Errorf("ancestor %s denied by subpath (its contents must stay writable):\n%s", ancestor, sbpl)
+		}
+	}
 	if _, err := BuildSBPL(Profile{ID: "p", FS: FSSpec{Protect: []string{"/tmp/x\")(allow default"}}}, ws); err == nil {
 		t.Error("BuildSBPL accepted an unsafe protected path literal")
 	}
@@ -78,7 +88,7 @@ func TestApplyProtect_SeatbeltBlocksWrites(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(state, "allow.json"), []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("/bin/sh", "-c", `echo ok > "$WS/ok" || exit 10; echo pwned > "$STATE/allow.json" 2>/dev/null && exit 11; echo x > "$STATE/new" 2>/dev/null && exit 12; exit 0`)
+	cmd := exec.Command("/bin/sh", "-c", `echo ok > "$WS/ok" || exit 10; echo pwned > "$STATE/allow.json" 2>/dev/null && exit 11; echo x > "$STATE/new" 2>/dev/null && exit 12; mv "$WS" "$WS.moved" 2>/dev/null && exit 13; exit 0`)
 	cmd.Env = append(os.Environ(), "WS="+ws, "STATE="+state)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out

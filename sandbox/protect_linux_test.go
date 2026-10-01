@@ -85,10 +85,22 @@ func TestBwrapProtectHostFilesystem(t *testing.T) {
 	if argIndex(args, "--ro-bind", state) < 0 {
 		t.Errorf("protected path not bound read-only: %v", args)
 	}
-	for _, flag := range []string{"--unshare-pid", "--unshare-ipc", "--unshare-uts", "--new-session", "--unshare-net", "--tmpfs"} {
+	for _, flag := range []string{"--unshare-ipc", "--unshare-uts", "--new-session", "--unshare-net", "--tmpfs"} {
 		if slices.Contains(args, flag) {
 			t.Errorf("host filesystem profile with Net carries %s: %v", flag, args)
 		}
+	}
+	// A private /proc: the host's would offer /proc/<pid>/root of same-uid
+	// host processes, a way around every bind here.
+	if !slices.Contains(args, "--unshare-pid") || argIndex(args, "--proc", "/proc") < 0 && !strings.Contains(strings.Join(args, " "), "--proc /proc") {
+		t.Errorf("host filesystem profile lacks a private pid namespace and /proc: %v", args)
+	}
+	// The renameable ancestors of the protected path are pinned, shallow first,
+	// before the read-only bind.
+	parent := filepath.Dir(state)
+	pin, ro := argIndex(args, "--dev-bind", parent), argIndex(args, "--ro-bind", state)
+	if pin < 0 || ro < pin {
+		t.Errorf("want --dev-bind %s (ancestor pin) before --ro-bind %s: %v", parent, state, args)
 	}
 	offline, err := BuildBwrapArgs(Profile{ID: "host", HostFilesystem: true}, ws)
 	if err != nil || !slices.Contains(offline, "--unshare-net") {
@@ -207,6 +219,95 @@ func TestApplyResolvedProtectBlocksWritesUnderAWriteGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("/bin/sh", "-c", `echo ok > "$P/work" || exit 10; echo pwned > "$P/.control/db" 2>/dev/null && exit 11; echo x > "$P/.control/new" 2>/dev/null && exit 12; exit 0`)
+	cmd.Env = []string{"P=" + project, "PATH=/usr/bin:/bin"}
+	out, cleanup, err := ApplyResolved(cmd, p)
+	if err != nil {
+		t.Fatalf("ApplyResolved: %+v %v", out, err)
+	}
+	defer cleanup()
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sandboxed script: %v\n%s", err, output)
+	}
+	if got, _ := os.ReadFile(filepath.Join(state, "db")); string(got) != "original" {
+		t.Errorf("protected file = %q after the run, want unchanged", got)
+	}
+}
+
+// The attack the adversarial review named: with /W writable and /W/state
+// protected, `mv /W /W2` carries the read-only mount away, and the child
+// recreates /W/state for the host to read. Pinning every renameable ancestor
+// makes each a mount point, which cannot be renamed or removed.
+func TestApplyProtectBlocksAncestorRenameAndFileTampering(t *testing.T) {
+	requireBwrapLinux(t)
+	script := `
+set -u
+for a in "$W/sub" "$W" "$BASE"; do mv "$a" "$a.moved" 2>/dev/null && exit 20; done
+rmdir "$W/sub" 2>/dev/null && exit 21
+echo pwned > "$W/sub/state/allow.json" 2>/dev/null && exit 22
+echo pwned > "$W/config.json" 2>/dev/null && exit 23
+mv "$W/config.json" "$W/moved.json" 2>/dev/null && exit 24
+rm -f "$W/config.json" 2>/dev/null; [ -f "$W/config.json" ] || exit 25
+ln "$W/config.json" "$W/hard.json" 2>/dev/null && exit 26
+echo ok > "$W/sibling" || exit 27
+mkdir "$W/newdir" || exit 28
+exit 0
+`
+	for _, name := range []string{"host-filesystem", "narrowed"} {
+		t.Run(name, func(t *testing.T) {
+			base := realDir(t)
+			w := filepath.Join(base, "W")
+			state := filepath.Join(w, "sub", "state")
+			file := filepath.Join(w, "config.json")
+			if err := os.MkdirAll(state, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for path, body := range map[string]string{filepath.Join(state, "allow.json"): "original", file: "original"} {
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			profile := Profile{ID: name, HostFilesystem: name == "host-filesystem", Net: true, Subprocess: true, FS: FSSpec{Protect: []string{state, file}}}
+			cmd := exec.Command("/bin/sh", "-c", script)
+			cmd.Dir = base
+			cmd.Env = append(os.Environ(), "BASE="+base, "W="+w)
+			cleanup, err := Apply(cmd, profile, base)
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			defer cleanup()
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("sandboxed script: %v\n%s", err, out)
+			}
+			for _, path := range []string{filepath.Join(state, "allow.json"), file} {
+				if got, _ := os.ReadFile(path); string(got) != "original" {
+					t.Errorf("%s = %q after the run, want unchanged", path, got)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyResolvedProtectBlocksAncestorRename(t *testing.T) {
+	requireBwrapLinux(t)
+	project := realDir(t)
+	state := filepath.Join(project, "a", "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "db"), []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := ResolveAccessPolicy(AccessPolicy{
+		ID:      "resolved-ancestor",
+		Roots:   Roots{Project: project},
+		FS:      FilesystemAccess{Write: []PathRef{{Root: ProjectRoot}}, Protect: []PathRef{{Root: ProjectRoot, Relative: "a/state"}}},
+		Runtime: RuntimeAccess{Executable: PathRef{Path: "/bin/sh"}},
+		Network: NetworkAccess{Mode: NetworkFull},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", "-c", `mv "$P/a" "$P/a2" 2>/dev/null && { mkdir -p "$P/a/state"; echo pwned > "$P/a/state/db"; exit 20; }; echo ok > "$P/a/sibling" || exit 21; exit 0`)
 	cmd.Env = []string{"P=" + project, "PATH=/usr/bin:/bin"}
 	out, cleanup, err := ApplyResolved(cmd, p)
 	if err != nil {

@@ -335,14 +335,34 @@ func writeResolvedDenies(b *strings.Builder, paths []string) error {
 // write allow so they take precedence; they leave reads to the rules above.
 // Seatbelt matches by path, so a protected path that does not exist yet is
 // protected too, unlike Linux bwrap.
+//
+// Each ancestor is also denied writes by literal: the entry itself, not its
+// contents. Without it the child could rename an ancestor away and put a
+// symlink to its own directory in its place, so the protected path resolves
+// somewhere writable (the macOS form of the rename the Linux backend blocks by
+// pinning ancestors).
 func writeProtectDenies(b *strings.Builder, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
 	b.WriteString("; Write-protected paths: never writable, whatever allows them above.\n")
+	seen := map[string]bool{}
 	for _, path := range paths {
 		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
 			return err
+		}
+		for dir := filepath.Dir(path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+			if seen[dir] {
+				continue
+			}
+			seen[dir] = true
+			aliases, err := seatbeltAliases([]string{dir})
+			if err != nil {
+				return err
+			}
+			for _, alias := range aliases {
+				fmt.Fprintf(b, "(deny file-write* (literal \"%s\"))\n", alias)
+			}
 		}
 	}
 	b.WriteString("\n")
