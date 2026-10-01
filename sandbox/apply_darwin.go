@@ -129,14 +129,29 @@ func BuildSBPL(p Profile, workspace string) (string, error) {
 		b.WriteString("\n")
 	}
 
-	// Write-protected paths: after every write allow, so they win.
+	// Write-protected paths: after every write allow, so they win. Seatbelt
+	// matches real paths, so each is canonicalized (/tmp/x is
+	// /private/tmp/x) and writeProtectDenies adds the alias back.
 	protected := make([]string, 0, len(p.FS.Protect))
 	for i, raw := range p.FS.Protect {
 		path, err := expandAndValidate(fmt.Sprintf("FS.Protect[%d]", i), raw, absWS)
 		if err != nil {
 			return "", err
 		}
-		protected = append(protected, path)
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf("%w: protected path %q must be absolute (or ~/..., or workspace)", ErrUnsupportedPolicy, raw)
+		}
+		if err := validateProtectPath(path); err != nil {
+			return "", err
+		}
+		canonical, err := canonicalPath(path)
+		if err != nil {
+			return "", fmt.Errorf("sandbox: resolve protected path %q: %w", raw, err)
+		}
+		protected = append(protected, canonical)
+	}
+	if err := validateProtectSet(protected); err != nil {
+		return "", err
 	}
 	if err := writeProtectDenies(&b, protected); err != nil {
 		return "", err
@@ -268,14 +283,6 @@ func existingDarwinPaths(paths []string) []string {
 	return out
 }
 
-func resolvedPathStrings(paths []ResolvedPath) []string {
-	out := make([]string, 0, len(paths))
-	for _, path := range paths {
-		out = append(out, path.Path)
-	}
-	return out
-}
-
 func writeResolvedReadAllows(b *strings.Builder, paths []string) error {
 	if len(paths) == 0 {
 		return nil
@@ -349,6 +356,14 @@ func writeProtectDenies(b *strings.Builder, paths []string) error {
 	seen := map[string]bool{}
 	for _, path := range paths {
 		if err := writeSeatbeltPathRule(b, "deny", "file-write*", path); err != nil {
+			return err
+		}
+		// Hard links: a link to a protected file from a writable directory
+		// would be a second, unprotected name for the same file. Seatbelt
+		// may check link creation as its own operation, separate from
+		// file-write* on the new name, so deny it explicitly. (Linux refuses
+		// it with EXDEV across the bind.) Not yet run on a Mac.
+		if err := writeSeatbeltPathRule(b, "deny", "file-link", path); err != nil {
 			return err
 		}
 		for dir := filepath.Dir(path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {

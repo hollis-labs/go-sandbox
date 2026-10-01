@@ -81,21 +81,31 @@ Unsupported resolved capabilities fail explicitly rather than falling back to br
   - `Deny` still wins over it.
   - `ResolvedAccessPolicy.WithProtected(paths...)` adds absolute paths to a policy resolved elsewhere.
   - It is reported as the `write-protect` capability, which both backends provide.
-- **Linux:** bwrap read-only-binds each protected path over the writable mounts, so writes, creates, renames and unlinks inside it fail.
-  - Every ancestor the child could rename is first bound onto itself, rw as before. A mount point can't be renamed or removed, so the child can't `mv` the protected tree aside and recreate it with its own content.
+- **What may be protected:**
+  - **Directories only.** A file's directory stays writable, so the host's own atomic save (rename over the file) or a database sidecar planted beside it (SQLite's `-wal`) defeats file-level protection. A non-directory entry is refused unless a protected directory covers it.
+  - **Absolute paths only.** A relative entry is refused.
+  - **No re-pointable symlinks.** An entry that goes through a symlink in a directory the uid can write is refused, because the child could swap the link after launch. Pass the real path.
+- **Linux:** bwrap read-only-binds each protected directory over the writable mounts, so writes, creates, renames and unlinks inside it fail.
+  - Every ancestor the child could rename is bound onto itself first, rw. A mount point can't be renamed or removed, so the child can't `mv` the protected tree aside and recreate it with its own content.
+  - The pins come before any read mount, so they never cover a read-only grant beneath them.
+  - Binds go where the child sees the path. A workspace or write root reached through a symlink gets the bind at its symlinked path, and an existing protected directory under a writable mount that can't be bound fails the launch.
   - A protected path that does not exist cannot be bound without creating it on the host. Where the child could create it, it is refused at launch; create it first or protect its existing parent. Elsewhere it is skipped.
-- **macOS:** seatbelt denies `file-write*` on it, by path, after every allow.
-  - Each ancestor is also denied writes by literal: the entry, not its contents. That stops an ancestor being renamed away and replaced with a symlink to a writable dir.
+- **macOS:** seatbelt denies `file-write*` and `file-link` on each protected path, by its real path and the `/tmp` or `/var` alias, after every allow.
+  - Each ancestor is also denied writes by literal (the entry, not its contents), so it can't be renamed away and replaced with a symlink to a writable dir.
+  - These macOS rules are reasoned and their tests compile, but they have **not yet run on a Mac**. In particular, `file-link` must be confirmed as an operation `sandbox-exec` accepts before a release.
 - **No sandbox today:** for a host whose agents run unconfined and only need this protection, `Profile{HostFilesystem: true, Net: true, Subprocess: true, FS: FSSpec{Protect: …}}` is the minimal sandbox.
   - On Linux it binds the host filesystem writable with devices (`--dev-bind / /`).
-  - It gives the child its own pid namespace and `/proc`, so no host process's `/proc/<pid>/root` leads around the binds.
-  - It shares the ipc and uts namespaces and the session, so a PTY keeps its terminal.
+  - It gives the child its own pid namespace and `/proc`. With paths to protect it requires the user namespace (`--unshare-user`), so the kernel refuses `/proc/<pid>/root` and ptrace of host processes from inside.
+  - It shares the ipc and uts namespaces and the session. There is no `--new-session`, because a PTY session needs its controlling terminal; TIOCSTI injection into a parent's terminal is off by default since Linux 6.2.
   - It refuses `FS.Deny`.
   - macOS legacy profiles are already default-allow.
-  - **Boundary:** Protect stops direct writes in every mode. Against writes delegated to another process (for example `systemd-run --user` over `$XDG_RUNTIME_DIR/bus` or `$XDG_RUNTIME_DIR/systemd/private`), it holds only under a narrowed or resolved policy that doesn't mount those sockets. HostFilesystem mode is not a boundary against delegation. The host filesystem includes the user's runtime sockets (the D-Bus session bus and the systemd user manager), terminal-multiplexer sockets, and the host apps' own APIs, and any same-uid service behind them can write for the agent. Hiding `$XDG_RUNTIME_DIR` wholesale would break ssh-agent and the keyring, which uses the session bus, so it is not hidden.
-- **Limits:**
-  - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead.
-  - A path the app reaches through a symlink in an agent-writable directory can be re-pointed, so protect the real path the app opens.
+- **Boundary:**
+  - Protect stops **direct writes** to the protected paths in every mode.
+  - Against writes **delegated** to another process, it holds only under a narrowed or resolved policy that doesn't mount the sockets involved. An example is `systemd-run --user` over `$XDG_RUNTIME_DIR/bus` or `$XDG_RUNTIME_DIR/systemd/private`.
+  - **HostFilesystem mode is not an isolation boundary.** Its child reaches the user's runtime sockets, terminal-multiplexer sockets and the host apps' own APIs, and any same-uid service behind them can write for it. With `$HOME` writable it can also plant code that runs outside the sandbox later: `~/.bashrc`, `~/.config/systemd/user`, git hooks.
+  - Hiding `$XDG_RUNTIME_DIR` wholesale would break ssh-agent and the keyring, which uses the session bus. An opt-in to hide the systemd user-manager sockets is a follow-up.
+- **Other limits:**
+  - A read-only mount does not stop `connect(2)` to a Unix socket, so hide a control socket with `Deny` instead. A socket is not a directory, so it can't be protected anyway.
 
 Existing callers can continue using `Profile` directly:
 

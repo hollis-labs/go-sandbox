@@ -244,10 +244,10 @@ set -u
 for a in "$W/sub" "$W" "$BASE"; do mv "$a" "$a.moved" 2>/dev/null && exit 20; done
 rmdir "$W/sub" 2>/dev/null && exit 21
 echo pwned > "$W/sub/state/allow.json" 2>/dev/null && exit 22
-echo pwned > "$W/config.json" 2>/dev/null && exit 23
-mv "$W/config.json" "$W/moved.json" 2>/dev/null && exit 24
-rm -f "$W/config.json" 2>/dev/null; [ -f "$W/config.json" ] || exit 25
-ln "$W/config.json" "$W/hard.json" 2>/dev/null && exit 26
+echo pwned > "$W/sub/state/allow.json-wal" 2>/dev/null && exit 23
+mv "$W/sub/state/allow.json" "$W/moved.json" 2>/dev/null && exit 24
+rm -f "$W/sub/state/allow.json" 2>/dev/null; [ -f "$W/sub/state/allow.json" ] || exit 25
+ln "$W/sub/state/allow.json" "$W/hard.json" 2>/dev/null && exit 26
 echo ok > "$W/sibling" || exit 27
 mkdir "$W/newdir" || exit 28
 exit 0
@@ -257,16 +257,13 @@ exit 0
 			base := realDir(t)
 			w := filepath.Join(base, "W")
 			state := filepath.Join(w, "sub", "state")
-			file := filepath.Join(w, "config.json")
 			if err := os.MkdirAll(state, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			for path, body := range map[string]string{filepath.Join(state, "allow.json"): "original", file: "original"} {
-				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-					t.Fatal(err)
-				}
+			if err := os.WriteFile(filepath.Join(state, "allow.json"), []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
 			}
-			profile := Profile{ID: name, HostFilesystem: name == "host-filesystem", Net: true, Subprocess: true, FS: FSSpec{Protect: []string{state, file}}}
+			profile := Profile{ID: name, HostFilesystem: name == "host-filesystem", Net: true, Subprocess: true, FS: FSSpec{Protect: []string{state}}}
 			cmd := exec.Command("/bin/sh", "-c", script)
 			cmd.Dir = base
 			cmd.Env = append(os.Environ(), "BASE="+base, "W="+w)
@@ -278,10 +275,11 @@ exit 0
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("sandboxed script: %v\n%s", err, out)
 			}
-			for _, path := range []string{filepath.Join(state, "allow.json"), file} {
-				if got, _ := os.ReadFile(path); string(got) != "original" {
-					t.Errorf("%s = %q after the run, want unchanged", path, got)
-				}
+			if got, _ := os.ReadFile(filepath.Join(state, "allow.json")); string(got) != "original" {
+				t.Errorf("allow.json = %q after the run, want unchanged", got)
+			}
+			if _, err := os.Stat(filepath.Join(state, "allow.json-wal")); err == nil {
+				t.Error("a sidecar was planted in the protected dir")
 			}
 		})
 	}
@@ -319,5 +317,108 @@ func TestApplyResolvedProtectBlocksAncestorRename(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(state, "db")); string(got) != "original" {
 		t.Errorf("protected file = %q after the run, want unchanged", got)
+	}
+}
+
+func TestBwrapProtectRefusesFilesRelativeAndRepointablePaths(t *testing.T) {
+	ws := realDir(t)
+	file := filepath.Join(ws, "torque.db")
+	if err := os.WriteFile(file, []byte("rows"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(ws, "real-state")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(ws, "state")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	for name, entry := range map[string]string{"file": file, "relative": "state", "symlink in a writable dir": link} {
+		for _, host := range []bool{false, true} {
+			if _, err := BuildBwrapArgs(Profile{ID: "p", HostFilesystem: host, FS: FSSpec{Protect: []string{entry}}}, ws); !errors.Is(err, ErrUnsupportedPolicy) {
+				t.Errorf("%s (host filesystem %v): err = %v, want ErrUnsupportedPolicy", name, host, err)
+			}
+		}
+	}
+}
+
+// With protected paths, host-filesystem mode requires the user namespace
+// (the kernel's ptrace and /proc/<pid>/root checks across it), rather than
+// trying it.
+func TestBwrapProtectHostFilesystemRequiresUserNamespace(t *testing.T) {
+	ws := realDir(t)
+	state := realDir(t)
+	args, err := BuildBwrapArgs(Profile{ID: "host", HostFilesystem: true, Net: true, FS: FSSpec{Protect: []string{state}}}, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(args, "--unshare-user") || slices.Contains(args, "--unshare-user-try") {
+		t.Errorf("want --unshare-user (required), got %v", args)
+	}
+	unprotected, err := BuildBwrapArgs(Profile{ID: "host", HostFilesystem: true, Net: true}, ws)
+	if err != nil || !slices.Contains(unprotected, "--unshare-user-try") {
+		t.Errorf("without protected paths: %v, %v; want --unshare-user-try", unprotected, err)
+	}
+}
+
+// A workspace reached through a symlink: the child sees it at the symlinked
+// path, so the read-only bind must go there too. Before, the protected path
+// (canonical) was compared with the unresolved workspace, nothing was bound,
+// and the write landed.
+func TestApplyProtectUnderSymlinkedWorkspace(t *testing.T) {
+	requireBwrapLinux(t)
+	base := realDir(t)
+	realWS := filepath.Join(base, "real")
+	state := filepath.Join(realWS, "proj", "state")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "allow.json"), []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realWS, filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(base, "link", "proj")
+	cmd := exec.Command("/bin/sh", "-c", `echo pwned > "$WS/state/allow.json" 2>/dev/null && exit 20; echo ok > "$WS/beside" || exit 21; exit 0`)
+	cmd.Dir = ws
+	cmd.Env = append(os.Environ(), "WS="+ws)
+	cleanup, err := Apply(cmd, Profile{ID: "symlinked-ws", Net: true, Subprocess: true, FS: FSSpec{Protect: []string{state}}}, ws)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer cleanup()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sandboxed script: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(state, "allow.json")); string(got) != "original" {
+		t.Errorf("allow.json = %q after the run, want unchanged", got)
+	}
+}
+
+// Pins are emitted before the read mounts: a pin on an ancestor of a
+// protected dir must not cover a read-only grant beneath that ancestor and
+// make it writable again.
+func TestApplyProtectPinsDoNotUnshadowReadOnlyGrants(t *testing.T) {
+	requireBwrapLinux(t)
+	ws := realDir(t)
+	readOnly := filepath.Join(ws, "a", "ro")
+	state := filepath.Join(ws, "a", "b", "state")
+	for _, dir := range []string{readOnly, state} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("/bin/sh", "-c", `echo x > "$WS/a/ro/x" 2>/dev/null && exit 20; echo x > "$WS/a/b/state/x" 2>/dev/null && exit 21; echo ok > "$WS/a/beside" || exit 22; exit 0`)
+	cmd.Dir = ws
+	cmd.Env = append(os.Environ(), "WS="+ws)
+	cleanup, err := Apply(cmd, Profile{ID: "ro-under-pin", Net: true, Subprocess: true, FS: FSSpec{Read: []string{readOnly}, Protect: []string{state}}}, ws)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer cleanup()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sandboxed script: %v\n%s", err, out)
 	}
 }

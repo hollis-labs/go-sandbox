@@ -129,6 +129,30 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 		args = append(args, "--bind", path, path)
 	}
 
+	// Write protection (Profile.FS.Protect): plan it against every mount the
+	// child sees, in the child's path space. Pins go here, after the writable
+	// mounts and before the read mounts, so a pin never covers a read-only
+	// grant beneath it; the read-only binds go after everything.
+	roots := []protectRoot{newProtectRoot(absWS, true)}
+	for _, raw := range p.FS.Write {
+		roots = append(roots, newProtectRoot(expandPathLinux(raw, absWS, home), true))
+	}
+	for _, raw := range p.FS.Read {
+		roots = append(roots, newProtectRoot(expandPathLinux(raw, absWS, home), false))
+	}
+	for _, path := range existingLinuxPaths(bwrapRoBindCandidates) {
+		roots = append(roots, newProtectRoot(path, false))
+	}
+	protected, err := legacyProtectPaths(p.FS.Protect, absWS, home)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := planProtect(protected, roots)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, plan.pinArgs("--bind")...)
+
 	// Additional Read paths (try-bind so missing paths are skipped, not errors).
 	for _, raw := range p.FS.Read {
 		path := expandPathLinux(raw, absWS, home)
@@ -138,22 +162,7 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 		seen[path] = true
 		args = append(args, "--ro-bind-try", path, path)
 	}
-
-	// Write protection goes over the writable mounts above.
-	writable := []string{absWS}
-	for _, raw := range p.FS.Write {
-		writable = append(writable, expandPathLinux(raw, absWS, home))
-	}
-	protect, err := bwrapProtectBinds(
-		expandAll(p.FS.Protect, absWS, home),
-		func(path string) bool { return pathVisibleInSandbox(path, absWS, p) },
-		func(path string) bool { return pathUnderAny(path, writable) },
-		"--bind",
-	)
-	if err != nil {
-		return nil, err
-	}
-	args = append(args, protect...)
+	args = append(args, plan.bindArgs()...)
 
 	// Namespace isolation (gap #2). --unshare-user-try degrades on kernels
 	// that disable unprivileged user namespaces (common in hardened distros);
@@ -188,102 +197,191 @@ func buildHostFilesystemBwrapArgs(p Profile, workspace string) ([]string, error)
 		return nil, fmt.Errorf("%w: profile %q: FS.Deny is not enforced by a host-filesystem profile on linux", ErrUnsupportedPolicy, p.ID)
 	}
 	home, _ := os.UserHomeDir()
-	// A private pid namespace and /proc: the host's /proc would offer
-	// /proc/<pid>/root of every same-uid host process, a path into the host
-	// mount namespace that no bind here covers. The user namespace already
-	// refuses that traversal; this keeps it refused under a setuid bwrap,
-	// which does not create one.
-	args := []string{"--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc"}
-	protect, err := bwrapProtectBinds(
-		expandAll(p.FS.Protect, workspace, home),
-		func(string) bool { return true },
-		func(string) bool { return true },
-		"--dev-bind",
-	)
+	protected, err := legacyProtectPaths(p.FS.Protect, workspace, home)
 	if err != nil {
 		return nil, err
 	}
-	args = append(args, protect...)
-	args = append(args, "--unshare-user-try", "--die-with-parent")
+	plan, err := planProtect(protected, []protectRoot{{Dest: "/", Canon: "/", Writable: true}})
+	if err != nil {
+		return nil, err
+	}
+	// A private pid namespace and /proc: the host's /proc would offer
+	// /proc/<pid>/root of every same-uid host process, a path into the host
+	// mount namespace that no bind here covers.
+	args := []string{"--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc"}
+	args = append(args, plan.pinArgs("--dev-bind")...)
+	args = append(args, plan.bindArgs()...)
+	// With paths to protect, the user namespace is required, not tried: it is
+	// what makes the kernel refuse /proc/<pid>/root and ptrace of host
+	// processes from inside, so a bwrap that cannot create one must fail.
+	if len(protected) > 0 {
+		args = append(args, "--unshare-user")
+	} else {
+		args = append(args, "--unshare-user-try")
+	}
+	// No --new-session: a PTY session needs its controlling terminal, and
+	// setsid would take it away. TIOCSTI injection into a parent's terminal
+	// is off by default since Linux 6.2 (dev.tty.legacy_tiocsti=0).
+	args = append(args, "--die-with-parent")
 	if !p.Net {
 		args = append(args, "--unshare-net")
 	}
 	return args, nil
 }
 
-// bwrapProtectBinds returns the binds that write-protect paths
-// (FilesystemAccess.Protect, Profile.FS.Protect). They must follow the mounts
-// that make the paths visible.
+// legacyProtectPaths expands Profile.FS.Protect (~, ${HOME}, the workspace
+// token), requires each to be absolute, refuses ones the child could re-point
+// or that are not directories, and returns their canonical host paths.
+func legacyProtectPaths(raws []string, workspace, home string) ([]string, error) {
+	out := make([]string, 0, len(raws))
+	for _, raw := range raws {
+		path := expandPathLinux(raw, workspace, home)
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("%w: protected path %q must be absolute (or ~/..., or workspace)", ErrUnsupportedPolicy, raw)
+		}
+		if err := validateProtectPath(path); err != nil {
+			return nil, err
+		}
+		canonical, err := canonicalPath(path)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: resolve protected path %q: %w", raw, err)
+		}
+		if !slices.Contains(out, canonical) {
+			out = append(out, canonical)
+		}
+	}
+	if err := validateProtectSet(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// protectRoot is a mount the sandbox shows: Dest is where the child sees it,
+// Canon the host directory it resolves to, Writable whether the child writes
+// through it.
+type protectRoot struct {
+	Dest, Canon string
+	Writable    bool
+}
+
+func newProtectRoot(dest string, writable bool) protectRoot {
+	dest = filepath.Clean(dest)
+	canon := dest
+	if resolved, err := filepath.EvalSymlinks(dest); err == nil {
+		canon = resolved
+	}
+	return protectRoot{Dest: dest, Canon: canon, Writable: writable}
+}
+
+// protectPlan is the binds that write-protect paths, in the child's path
+// space: pins (renameable ancestors bound onto themselves) and read-only
+// binds over the protected directories.
+type protectPlan struct {
+	pins, binds []string
+}
+
+func (p protectPlan) pinArgs(flag string) []string {
+	args := make([]string, 0, 3*len(p.pins))
+	for _, pin := range p.pins {
+		args = append(args, flag, pin, pin)
+	}
+	return args
+}
+
+func (p protectPlan) bindArgs() []string {
+	args := make([]string, 0, 3*len(p.binds))
+	for _, bind := range p.binds {
+		args = append(args, "--ro-bind", bind, bind)
+	}
+	return args
+}
+
+// planProtect maps canonical protected paths (validated: absolute, not
+// re-pointable, directories) into the child's path space through roots, the
+// mounts the child sees. A root whose Dest is a symlink on the host still
+// shows the protected directory at Dest plus the relative path, which is
+// where the bind must go.
 //
-//   - A path that exists and is visible gets --ro-bind over itself. One that
-//     is not visible stays hidden, since protection grants nothing.
-//   - Every ancestor the child could rename (its parent is writable) is first
-//     bound onto itself with pinFlag, rw as before. A mount point cannot be
-//     renamed or removed (EBUSY), so the child cannot move the protected
-//     tree aside, for example `mv /W /W2`, which carries the read-only mount
-//     with it, and recreate /W/state with its own content for the host to
-//     read.
-//   - A path that does not exist cannot be bound without creating it on the
-//     host, so it is refused when the child could create it (its nearest
-//     existing ancestor is writable and not itself protected), and skipped
-//     otherwise.
-func bwrapProtectBinds(paths []string, visible, writable func(string) bool, pinFlag string) ([]string, error) {
-	var existing, missing []string
-	for _, raw := range paths {
-		path := filepath.Clean(raw)
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			path = resolved
-		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("sandbox: inspect protected path %q: %w", raw, err)
-		} else {
-			missing = append(missing, path)
-			continue
+//   - A protected directory under a writable root gets a read-only bind at
+//     each place the child sees it. Read-only roots need nothing, and one no
+//     root shows stays hidden: protection grants nothing.
+//   - Every ancestor between the writable root's Dest and the bind is pinned:
+//     bound onto itself, rw as before. A mount point cannot be renamed or
+//     removed (EBUSY), so the child cannot `mv /W /W2`, carrying the
+//     read-only mount away, and recreate /W/state with its own content for
+//     the host to read.
+//   - A protected path that does not exist cannot be bound without creating
+//     it on the host, so it is refused where the child could create it (its
+//     nearest existing ancestor is under a writable root and not itself
+//     protected), and skipped otherwise.
+//
+// It fails closed: an existing protected directory under a writable root
+// that ends up with no bind is an error.
+func planProtect(paths []string, roots []protectRoot) (protectPlan, error) {
+	var dirs, missing []string
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				missing = append(missing, path)
+				continue
+			}
+			return protectPlan{}, fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
 		}
-		if !slices.Contains(existing, path) {
-			existing = append(existing, path)
-		}
+		dirs = append(dirs, path)
+	}
+	nested := func(path string) bool {
+		return slices.ContainsFunc(dirs, func(dir string) bool { return dir != path && pathUnderAny(path, []string{dir}) })
 	}
 	for _, path := range missing {
 		ancestor := nearestExistingAncestor(path)
-		if pathUnderAny(ancestor, existing) {
+		if pathUnderAny(ancestor, dirs) {
 			continue
 		}
-		if visible(ancestor) && writable(ancestor) {
-			return nil, fmt.Errorf("%w: protected path %q does not exist and the sandboxed process could create it; create it before launch or protect its existing parent", ErrUnsupportedPolicy, path)
+		for _, root := range roots {
+			if root.Writable && pathUnderAny(ancestor, []string{root.Canon}) {
+				return protectPlan{}, fmt.Errorf("%w: protected path %q does not exist and the sandboxed process could create it; create it before launch or protect its existing parent", ErrUnsupportedPolicy, path)
+			}
 		}
 	}
-	slices.SortFunc(existing, func(a, b string) int {
-		if da, db := pathDepthLinux(a), pathDepthLinux(b); da != db {
-			return da - db
+	var plan protectPlan
+	for _, dir := range dirs {
+		if nested(dir) {
+			continue // a protected ancestor's bind already covers it
 		}
-		return strings.Compare(a, b)
-	})
-	var pins, binds []string
-	for _, path := range existing {
-		if !visible(path) {
-			continue
-		}
-		for _, ancestor := range parentDirsForBwrap(path) {
-			if slices.Contains(pins, ancestor) || slices.Contains(existing, ancestor) || pathUnderAny(ancestor, existing) {
+		bound, needed := false, false
+		for _, root := range roots {
+			if !root.Writable || !pathUnderAny(dir, []string{root.Canon}) {
 				continue
 			}
-			if visible(ancestor) && writable(filepath.Dir(ancestor)) {
-				pins = append(pins, ancestor)
+			needed = true
+			rel, err := filepath.Rel(root.Canon, dir)
+			if err != nil {
+				return protectPlan{}, fmt.Errorf("sandbox: place protected path %q under %q: %w", dir, root.Dest, err)
 			}
+			dest := filepath.Join(root.Dest, rel)
+			for ancestor := filepath.Dir(dest); ancestor != root.Dest && pathUnderAny(ancestor, []string{root.Dest}); ancestor = filepath.Dir(ancestor) {
+				if !slices.Contains(plan.pins, ancestor) {
+					plan.pins = append(plan.pins, ancestor)
+				}
+			}
+			if !slices.Contains(plan.binds, dest) {
+				plan.binds = append(plan.binds, dest)
+			}
+			bound = true
 		}
-		binds = append(binds, "--ro-bind", path, path)
+		if needed && !bound {
+			return protectPlan{}, fmt.Errorf("%w: protected path %q is writable in the sandbox but could not be bound read-only", ErrUnsupportedPolicy, dir)
+		}
 	}
-	slices.SortFunc(pins, func(a, b string) int {
+	byDepth := func(a, b string) int {
 		if da, db := pathDepthLinux(a), pathDepthLinux(b); da != db {
 			return da - db
 		}
 		return strings.Compare(a, b)
-	})
-	args := make([]string, 0, 3*len(pins)+len(binds))
-	for _, pin := range pins {
-		args = append(args, pinFlag, pin, pin)
 	}
-	return append(args, binds...), nil
+	slices.SortFunc(plan.pins, byDepth)
+	slices.SortFunc(plan.binds, byDepth)
+	return plan, nil
 }
 
 func nearestExistingAncestor(path string) string {
@@ -307,14 +405,6 @@ func pathUnderAny(path string, roots []string) bool {
 		}
 	}
 	return false
-}
-
-func expandAll(raws []string, workspace, home string) []string {
-	out := make([]string, 0, len(raws))
-	for _, raw := range raws {
-		out = append(out, expandPathLinux(raw, workspace, home))
-	}
-	return out
 }
 
 func legacyBwrapMountParentDirs(workspace string, p Profile, helperPath, bridgeDir, home string) []string {
@@ -744,12 +834,23 @@ func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string
 	}
 
 	// Write protection goes over the read/write mounts above and under the
-	// deny overlays below, so Deny still wins.
-	protect, err := bwrapProtectBinds(resolvedPathStringsLinux(p.FS.Protect), alreadyMounted, alreadyWritable, "--bind")
+	// deny overlays below, so Deny still wins. Resolved paths and roots are
+	// canonical, so each mount's Dest is its Canon. Deeper mounts under a
+	// writable root are not emitted (alreadyMounted), so the pins cannot
+	// cover one.
+	var protectRoots []protectRoot
+	for _, item := range p.allWrites() {
+		protectRoots = append(protectRoots, protectRoot{Dest: item.Path, Canon: item.Path, Writable: true})
+	}
+	for _, item := range p.allReads() {
+		protectRoots = append(protectRoots, protectRoot{Dest: item.Path, Canon: item.Path})
+	}
+	plan, err := planProtect(resolvedPathStrings(p.FS.Protect), protectRoots)
 	if err != nil {
 		return nil, err
 	}
-	args = append(args, protect...)
+	args = append(args, plan.pinArgs("--bind")...)
+	args = append(args, plan.bindArgs()...)
 
 	// Deny precedence is implemented after broader read/write parents are mounted.
 	// ApplyResolved passes unreadable shadow sources, which supports both file and
@@ -837,14 +938,6 @@ func pureResolvedBwrapDenyDirs(p ResolvedAccessPolicy) ([]string, error) {
 		return 0
 	})
 	return out, nil
-}
-
-func resolvedPathStringsLinux(paths []ResolvedPath) []string {
-	out := make([]string, 0, len(paths))
-	for _, item := range paths {
-		out = append(out, item.Path)
-	}
-	return out
 }
 
 func pathDepthLinux(path string) int {

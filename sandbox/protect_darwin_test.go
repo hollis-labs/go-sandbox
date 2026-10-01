@@ -29,6 +29,9 @@ func TestBuildSBPL_ProtectDeniesWritesAfterAllows(t *testing.T) {
 	if strings.Contains(sbpl, `(deny file-read* (subpath "/Users/test/ws/.state"))`) {
 		t.Errorf("protection must not deny reads:\n%s", sbpl)
 	}
+	if !strings.Contains(sbpl, `(deny file-link (subpath "/Users/test/ws/.state"))`) {
+		t.Errorf("missing file-link deny on the protected path:\n%s", sbpl)
+	}
 	// Ancestors are pinned by literal (the entry, not its contents), so the
 	// child cannot rename one away and symlink its own dir in its place.
 	for _, ancestor := range []string{"/Users/test/ws", "/Users/test", "/Users"} {
@@ -102,5 +105,31 @@ func TestApplyProtect_SeatbeltBlocksWrites(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(state, "allow.json")); string(got) != "original" {
 		t.Errorf("protected file = %q after the run, want unchanged", got)
+	}
+}
+
+// Seatbelt matches real paths: a protected /tmp/x must be denied as
+// /private/tmp/x, with the /tmp alias alongside.
+func TestBuildSBPL_ProtectCanonicalizesAndAliases(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "protect-alias-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbpl, err := BuildSBPL(Profile{ID: "p", FS: FSSpec{Protect: []string{dir}}, Net: true, Subprocess: true}, "/Users/test/ws")
+	if err != nil {
+		t.Fatalf("BuildSBPL: %v", err)
+	}
+	for _, want := range []string{`(deny file-write* (subpath "` + real + `"))`, `(deny file-write* (subpath "` + dir + `"))`} {
+		if !strings.Contains(sbpl, want) {
+			t.Errorf("missing %s:\n%s", want, sbpl)
+		}
+	}
+	if _, err := BuildSBPL(Profile{ID: "p", FS: FSSpec{Protect: []string{"relative/state"}}}, "/Users/test/ws"); err == nil {
+		t.Error("BuildSBPL accepted a relative protected path")
 	}
 }

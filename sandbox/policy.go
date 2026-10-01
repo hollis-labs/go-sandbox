@@ -296,6 +296,9 @@ func ResolveAccessPolicy(p AccessPolicy) (ResolvedAccessPolicy, error) {
 	if resolved.FS.Protect, err = resolvePathRefs(AccessProtect, p.FS.Protect, roots); err != nil {
 		return ResolvedAccessPolicy{}, err
 	}
+	if err := validateProtectSet(resolvedPathStrings(resolved.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
+	}
 
 	if p.Runtime.Executable != (PathRef{}) {
 		exe, err := resolvePathRef(AccessRuntimeRead, p.Runtime.Executable, roots)
@@ -375,6 +378,9 @@ func (p ResolvedAccessPolicy) WithProtected(paths ...string) (ResolvedAccessPoli
 		if !slices.ContainsFunc(out.FS.Protect, func(r ResolvedPath) bool { return r.Path == resolved.Path }) {
 			out.FS.Protect = append(out.FS.Protect, resolved)
 		}
+	}
+	if err := validateProtectSet(resolvedPathStrings(out.FS.Protect)); err != nil {
+		return ResolvedAccessPolicy{}, err
 	}
 	sortResolvedPolicy(&out)
 	return out, nil
@@ -671,6 +677,14 @@ func resolvePathRef(kind AccessKind, ref PathRef, roots ResolvedRoots) (Resolved
 		if ref.Path == "" {
 			return ResolvedPath{}, fmt.Errorf("sandbox: %s path ref needs root or path", kind)
 		}
+		if kind == AccessProtect {
+			if !filepath.IsAbs(ref.Path) {
+				return ResolvedPath{}, fmt.Errorf("sandbox: protected path %q must be absolute or under a root", ref.Path)
+			}
+			if err := validateProtectPath(ref.Path); err != nil {
+				return ResolvedPath{}, err
+			}
+		}
 		path, err := canonicalPath(ref.Path)
 		if err != nil {
 			return ResolvedPath{}, fmt.Errorf("sandbox: resolve %s path %q: %w", kind, ref.Path, err)
@@ -685,11 +699,96 @@ func resolvePathRef(kind AccessKind, ref PathRef, roots ResolvedRoots) (Resolved
 	if rel == "" {
 		rel = "."
 	}
+	if kind == AccessProtect {
+		if err := validateProtectPath(filepath.Join(root, rel)); err != nil {
+			return ResolvedPath{}, err
+		}
+	}
 	path, err := pathsafe.ResolveUnder(root, rel)
 	if err != nil {
 		return ResolvedPath{}, fmt.Errorf("sandbox: resolve %s under %s: %w", kind, ref.Root, err)
 	}
 	return ResolvedPath{Kind: kind, Root: ref.Root, Path: path, Source: rel}, nil
+}
+
+// validateProtectPath refuses a protected path the child could re-point: one
+// with a symlink component in a directory the current uid can write. The
+// backends protect the path the symlink resolves to at launch; the child
+// could then swap the link (`ln -s evil x.new && mv -T x.new x`) and the
+// host would follow it somewhere writable. Symlinks in directories the uid
+// cannot write (/var -> /private/var on macOS) are fixed and allowed. A
+// host passes the real path instead.
+func validateProtectPath(path string) error {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("sandbox: protected path %q must be absolute", path)
+	}
+	prefix := string(filepath.Separator)
+	for _, part := range strings.Split(strings.TrimPrefix(path, prefix), string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		parent := prefix
+		prefix = filepath.Join(prefix, part)
+		info, err := os.Lstat(prefix)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 && uidCanWrite(parent) {
+			return fmt.Errorf("%w: protected path %q goes through symlink %q in writable directory %q, which the sandboxed process could re-point; protect the real path", ErrUnsupportedPolicy, path, prefix, parent)
+		}
+	}
+	return nil
+}
+
+// validateProtectSet refuses protected paths that are not directories (unless
+// a protected directory already covers them). A file's directory stays
+// writable, which defeats file-level protection: the host's own atomic save
+// (write a temp file, rename it over the original) replaces the file the
+// sandbox protected, and a database's sidecar (SQLite's -wal, -journal) can
+// be planted beside it and read by the host. Protect the directory. paths are
+// canonical.
+func validateProtectSet(paths []string) error {
+	var dirs []string
+	type entry struct {
+		path string
+		dir  bool
+	}
+	var entries []entry
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("sandbox: inspect protected path %q: %w", path, err)
+		}
+		entries = append(entries, entry{path, info.IsDir()})
+		if info.IsDir() {
+			dirs = append(dirs, path)
+		}
+	}
+	for _, e := range entries {
+		if e.dir {
+			continue
+		}
+		if slices.ContainsFunc(dirs, func(dir string) bool { return dir != e.path && pathContains(dir, e.path) }) {
+			continue
+		}
+		return fmt.Errorf("%w: protected path %q is not a directory; protect its directory (a file's directory stays writable, so an atomic save or a database sidecar beside it defeats file-level protection)", ErrUnsupportedPolicy, e.path)
+	}
+	return nil
+}
+
+func resolvedPathStrings(paths []ResolvedPath) []string {
+	out := make([]string, 0, len(paths))
+	for _, item := range paths {
+		out = append(out, item.Path)
+	}
+	return out
 }
 
 func rootPath(roots ResolvedRoots, name RootName) (string, error) {

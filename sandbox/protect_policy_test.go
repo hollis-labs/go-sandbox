@@ -1,6 +1,7 @@
 package sandbox_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -84,7 +85,12 @@ func TestWithProtected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := base.WithProtected(link, real, project)
+	// A symlink in a directory the uid can write could be re-pointed by the
+	// child after launch, so it is refused; the real path is accepted.
+	if _, err := base.WithProtected(link); err == nil {
+		t.Fatal("WithProtected(symlink in a writable dir) = nil error, want refusal")
+	}
+	got, err := base.WithProtected(real, real, project)
 	if err != nil {
 		t.Fatalf("WithProtected: %v", err)
 	}
@@ -100,7 +106,7 @@ func TestWithProtected(t *testing.T) {
 	want := []string{realResolved, projectResolved}
 	slices.Sort(want)
 	if !slices.Equal(paths, want) {
-		t.Errorf("Protect = %v, want %v (symlink resolved, duplicates dropped)", paths, want)
+		t.Errorf("Protect = %v, want %v (canonical, duplicates dropped)", paths, want)
 	}
 	if len(base.FS.Protect) != 0 {
 		t.Errorf("WithProtected mutated its receiver: %v", base.FS.Protect)
@@ -143,5 +149,40 @@ func TestLoadProfileProtectAndHostFilesystem(t *testing.T) {
 	}
 	if !p.HostFilesystem || !slices.Equal(p.FS.Protect, []string{"/var/lib/app"}) {
 		t.Errorf("LoadProfile = %+v, want host_filesystem and fs.protect", p)
+	}
+}
+
+// A protected path must be a directory: a file's directory stays writable, so
+// the host's own atomic save, or a database sidecar planted beside it
+// (SQLite's -wal), defeats file-level protection.
+func TestProtectRefusesFiles(t *testing.T) {
+	project := t.TempDir()
+	db := filepath.Join(project, "torque.db")
+	if err := os.WriteFile(db, []byte("rows"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := sandbox.ResolveAccessPolicy(sandbox.AccessPolicy{
+		ID: "file", Roots: sandbox.Roots{Project: project},
+		FS: sandbox.FilesystemAccess{Write: []sandbox.PathRef{{Root: sandbox.ProjectRoot}}, Protect: []sandbox.PathRef{{Path: db}}},
+	})
+	if !errors.Is(err, sandbox.ErrUnsupportedPolicy) {
+		t.Fatalf("ResolveAccessPolicy(protect a file) err = %v, want ErrUnsupportedPolicy", err)
+	}
+	base, err := sandbox.ResolveAccessPolicy(sandbox.AccessPolicy{ID: "base", Roots: sandbox.Roots{Project: project}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.WithProtected(db); !errors.Is(err, sandbox.ErrUnsupportedPolicy) {
+		t.Fatalf("WithProtected(file) err = %v, want ErrUnsupportedPolicy", err)
+	}
+	// Covered by a protected directory, a file entry is redundant and allowed.
+	if _, err := base.WithProtected(project, db); err != nil {
+		t.Fatalf("WithProtected(dir, file in it) = %v, want nil", err)
+	}
+	if _, err := sandbox.ResolveAccessPolicy(sandbox.AccessPolicy{
+		ID: "relative", Roots: sandbox.Roots{Project: project},
+		FS: sandbox.FilesystemAccess{Protect: []sandbox.PathRef{{Path: "state"}}},
+	}); err == nil {
+		t.Fatal("ResolveAccessPolicy accepted a relative protected path")
 	}
 }
