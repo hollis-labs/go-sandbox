@@ -74,16 +74,19 @@ var bwrapRoBindCandidates = []string{
 // p.Net == true keeps the sandbox in the host netns. See README "Out of
 // scope: network proxy subsystem".
 func BuildBwrapArgs(p Profile, workspace string) ([]string, error) {
-	return buildBwrapArgs(p, workspace, "", "")
+	return buildBwrapArgs(p, workspace, "", "", nil)
 }
 
-func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]string, error) {
+// buildBwrapArgs builds the legacy bwrap arguments. env is the child's
+// environment (nil: the parent's), which DenyUserServiceManager reads for
+// the runtime directory and session bus to hide.
+func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string, env []string) ([]string, error) {
 	absWS, err := filepath.Abs(workspace)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace dir: %w", err)
 	}
 	if p.HostFilesystem {
-		return buildHostFilesystemBwrapArgs(p, absWS)
+		return buildHostFilesystemBwrapArgs(p, absWS, env)
 	}
 
 	args := make([]string, 0, 32)
@@ -163,6 +166,14 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 		args = append(args, "--ro-bind-try", path, path)
 	}
 	args = append(args, plan.bindArgs()...)
+	// Last of the mounts, over every grant that shows the runtime directory.
+	if p.DenyUserServiceManager {
+		masks, err := userManagerMasks(roots, nil, env, p.Net)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, masks...)
+	}
 
 	// Namespace isolation (gap #2). --unshare-user-try degrades on kernels
 	// that disable unprivileged user namespaces (common in hardened distros);
@@ -192,7 +203,7 @@ func buildBwrapArgs(p Profile, workspace, helperPath, bridgeDir string) ([]strin
 // write-protected paths. It shares the ipc and uts namespaces and the
 // session, so apart from protection the child sees only its own processes in
 // /proc and, when Net is false, no network.
-func buildHostFilesystemBwrapArgs(p Profile, workspace string) ([]string, error) {
+func buildHostFilesystemBwrapArgs(p Profile, workspace string, env []string) ([]string, error) {
 	if len(p.FS.Deny) > 0 {
 		return nil, fmt.Errorf("%w: profile %q: FS.Deny is not enforced by a host-filesystem profile on linux", ErrUnsupportedPolicy, p.ID)
 	}
@@ -211,6 +222,13 @@ func buildHostFilesystemBwrapArgs(p Profile, workspace string) ([]string, error)
 	args := []string{"--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc"}
 	args = append(args, plan.pinArgs("--dev-bind")...)
 	args = append(args, plan.bindArgs()...)
+	if p.DenyUserServiceManager {
+		masks, err := userManagerMasks([]protectRoot{{Dest: "/", Canon: "/", Writable: true}}, nil, env, p.Net)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, masks...)
+	}
 	// With paths to protect, the user namespace is required, not tried: it is
 	// what makes the kernel refuse /proc/<pid>/root and ptrace of host
 	// processes from inside, so a bwrap that cannot create one must fail.
@@ -600,7 +618,7 @@ func Apply(cmd *exec.Cmd, p Profile, workspace string) (cleanup func(), err erro
 	if bridge != nil {
 		bridgeDir = bridge.dir
 	}
-	bwrapArgs, err := buildBwrapArgs(p, workspace, payloadBindPath, bridgeDir)
+	bwrapArgs, err := buildBwrapArgs(p, workspace, payloadBindPath, bridgeDir, cmd.Env)
 	if err != nil {
 		if bridge != nil {
 			bridge.Close()
@@ -778,7 +796,7 @@ type bwrapDenyShadow struct {
 // mounted into the child namespace. SourceRead entries are intentionally not
 // mounted because they are preparation inputs, not execution grants.
 func BuildResolvedBwrap(p ResolvedAccessPolicy) ([]string, error) {
-	return buildResolvedBwrapArgs(p, "", "", nil)
+	return buildResolvedBwrapArgs(p, "", "", nil, nil)
 }
 
 // BuildResolvedBwrapArgs is kept as a compatibility alias for callers that
@@ -787,7 +805,9 @@ func BuildResolvedBwrapArgs(p ResolvedAccessPolicy) ([]string, error) {
 	return BuildResolvedBwrap(p)
 }
 
-func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string, denyShadows []bwrapDenyShadow) ([]string, error) {
+// buildResolvedBwrapArgs builds the resolved-policy bwrap arguments. env is
+// the child's environment (nil: the parent's); see buildBwrapArgs.
+func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string, denyShadows []bwrapDenyShadow, env []string) ([]string, error) {
 	if p.Mode == ConfinementDisabled {
 		return nil, fmt.Errorf("%w: disabled policy %q has no bwrap arguments", ErrUnsupportedPolicy, p.ID)
 	}
@@ -899,6 +919,20 @@ func buildResolvedBwrapArgs(p ResolvedAccessPolicy, helperPath, bridgeDir string
 		for _, denied := range deniedDirs {
 			args = append(args, "--perms", "000", "--dir", denied)
 		}
+	}
+
+	// Over every grant that shows the runtime directory, read-only ones
+	// included: a read-only mount does not stop connect(2) on a socket.
+	if p.DenyUserServiceManager {
+		maskRoots := slices.Clone(protectRoots)
+		for _, path := range bwrapResolvedSystemReadPaths() {
+			maskRoots = append(maskRoots, newProtectRoot(path, false))
+		}
+		masks, err := userManagerMasks(maskRoots, resolvedPathStrings(p.allDenies()), env, p.Network.Mode == NetworkFull)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, masks...)
 	}
 
 	args = append(args,
@@ -1238,7 +1272,7 @@ func applyResolved(cmd *exec.Cmd, p ResolvedAccessPolicy) (func(), error) {
 	if bridge != nil {
 		bridgeDir = bridge.dir
 	}
-	bwrapArgs, err := buildResolvedBwrapArgs(p, helperPath, bridgeDir, shadows)
+	bwrapArgs, err := buildResolvedBwrapArgs(p, helperPath, bridgeDir, shadows, cmd.Env)
 	if err != nil {
 		cleanupShadows()
 		if bridge != nil {

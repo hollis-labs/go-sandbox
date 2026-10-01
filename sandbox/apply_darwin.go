@@ -68,6 +68,9 @@ func validateSeatbeltLiteral(field, value string) error {
 // profile. An invalid value returns a non-nil error and the caller must
 // refuse to spawn the sandbox.
 func BuildSBPL(p Profile, workspace string) (string, error) {
+	if p.DenyUserServiceManager {
+		return "", errDarwinUserServiceManager(p.ID)
+	}
 	absWS, err := filepath.Abs(workspace)
 	if err != nil {
 		absWS = workspace
@@ -206,6 +209,9 @@ func BuildResolvedSBPL(p ResolvedAccessPolicy) (string, error) {
 	if p.Subprocess == SubprocessDeny {
 		return "", fmt.Errorf("sandbox: subprocess deny is unsupported by resolved darwin pre-spawn enforcement")
 	}
+	if p.DenyUserServiceManager {
+		return "", errDarwinUserServiceManager(p.ID)
+	}
 
 	var b strings.Builder
 	b.WriteString("(version 1)\n\n")
@@ -262,6 +268,13 @@ func BuildResolvedSBPL(p ResolvedAccessPolicy) (string, error) {
 // client of LaunchServices. Verified with sandbox-exec on macOS 15.7: exec of
 // /usr/bin/open fails with EPERM, and `lsappinfo list` returns nothing under
 // the lookup deny while returning the running apps without it.
+// errDarwinUserServiceManager refuses DenyUserServiceManager: launchd would
+// still run a job for the child (launchctl submit / bootstrap), and seatbelt
+// here does not cut that path off.
+func errDarwinUserServiceManager(id string) error {
+	return fmt.Errorf("%w: profile %q: DenyUserServiceManager is not enforced on darwin (launchd user agents)", ErrUnsupportedPolicy, id)
+}
+
 func writeGUILaunchDenies(b *strings.Builder) {
 	b.WriteString("; Deny GUI launch: no open(1), no LaunchServices.\n")
 	b.WriteString("(deny process-exec (literal \"/usr/bin/open\"))\n")

@@ -14,6 +14,8 @@ binary, or manage network egress (that is `go-egress-proxy`).
 - `sandbox/apply_policy.go` owns `ApplyResolved` and the enforcement outcome.
 - `sandbox/apply_darwin.go` builds SBPL; `sandbox/apply_linux.go` builds bwrap
   args.
+- `sandbox/user_service_manager_linux.go` owns `DenyUserServiceManager`'s
+  bwrap masks (systemd user manager sockets and the session bus).
 - `sandbox/apply_resolved_unsupported.go` and `apply_unsupported.go` are the
   honest no-backend paths.
 - `sandbox/profile.go` is the legacy `Profile` / `Apply` API kept for

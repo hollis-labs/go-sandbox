@@ -168,7 +168,7 @@ func TestApply_AllowLoopbackResolvesBareCommandName(t *testing.T) {
 
 func TestBwrapArgs_AllowLoopbackHelperBind(t *testing.T) {
 	helperPath := "/tmp/go-sandbox-helper"
-	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir(), helperPath, "")
+	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, AllowLoopback: true}, t.TempDir(), helperPath, "", nil)
 	if err != nil {
 		t.Fatalf("buildBwrapArgs: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestBwrapArgs_AllowLoopbackHelperBind(t *testing.T) {
 
 func TestBwrapArgs_LoopbackForwardDirBind(t *testing.T) {
 	bridgeDir := t.TempDir()
-	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, LoopbackForwardPorts: []int{4317}}, t.TempDir(), "", bridgeDir)
+	args, err := buildBwrapArgs(Profile{ID: "t", Net: false, LoopbackForwardPorts: []int{4317}}, t.TempDir(), "", bridgeDir, nil)
 	if err != nil {
 		t.Fatalf("buildBwrapArgs: %v", err)
 	}
